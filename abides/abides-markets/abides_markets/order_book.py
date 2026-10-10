@@ -680,13 +680,18 @@ class OrderBook:
             self.append_book_log2()
 
     def append_book_log2(self):
-        row = {
-            "QuoteTime": self.owner.current_time,
-            "bids": np.array(self.get_l2_bid_data(depth=self.owner.book_log_depth)),
-            "asks": np.array(self.get_l2_ask_data(depth=self.owner.book_log_depth)),
-        }
-        # if (row["bids"][0][0]>=row["asks"][0][0]): print("WARNING: THIS IS A REAL PROBLEM: an order book contains bids and asks at the same quote price!")
-        self.book_log2.append(row)
+        # Speedup: the only reader in a run is ExchangeAgent.get_time_dropout, which needs just the
+        # time and whether each side's top-N levels hold any volume (the same test as len(l2 data) == 0).
+        # Rows are (QuoteTime, bids_empty, asks_empty) tuples instead of full L2 numpy snapshots.
+        # ponytail: get_L1_snapshots/get_L2_snapshots (offline analysis helpers) no longer work on this log.
+        depth = self.owner.book_log_depth
+        self.book_log2.append(
+            (
+                self.owner.current_time,
+                not any(pl.total_quantity > 0 for pl in self.bids[:depth]),
+                not any(pl.total_quantity > 0 for pl in self.asks[:depth]),
+            )
+        )
 
     def get_l1_bid_data(self) -> Optional[Tuple[int, int]]:
         """Returns the current best bid price and of the book and the volume at this price."""

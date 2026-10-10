@@ -935,9 +935,9 @@ class ExchangeAgent(FinancialAgent):
         if len(book) == 0:
             return
 
-        df = pd.DataFrame(book)
-
-        total_time = df["QuoteTime"].iloc[-1] - df["QuoteTime"].iloc[0]
+        # Same walk as the original DataFrame.iterrows() loop, over the compact
+        # (QuoteTime, bids_empty, asks_empty) rows that OrderBook.append_book_log2 now records.
+        total_time = book[-1][0] - book[0][0]
         is_null_bids = False
         t_null_bids_first = 0
         T_null_bids = 0
@@ -946,19 +946,19 @@ class ExchangeAgent(FinancialAgent):
         t_null_asks_first = 0
         T_null_asks = 0
 
-        for _, row in df.iterrows():
-            if (len(row["bids"]) == 0) & (is_null_bids == False):
-                t_null_bids_first = row["QuoteTime"]
+        for quote_time, bids_empty, asks_empty in book:
+            if bids_empty and not is_null_bids:
+                t_null_bids_first = quote_time
                 is_null_bids = True
-            elif (len(row["bids"]) != 0) & (is_null_bids == True):
-                T_null_bids += row["QuoteTime"] - t_null_bids_first
+            elif not bids_empty and is_null_bids:
+                T_null_bids += quote_time - t_null_bids_first
                 is_null_bids = False
 
-            if (len(row["asks"]) == 0) & (is_null_asks == False):
-                t_null_asks_first = row["QuoteTime"]
+            if asks_empty and not is_null_asks:
+                t_null_asks_first = quote_time
                 is_null_asks = True
-            elif (len(row["asks"]) != 0) & (is_null_asks == True):
-                T_null_asks += row["QuoteTime"] - t_null_asks_first
+            elif not asks_empty and is_null_asks:
+                T_null_asks += quote_time - t_null_asks_first
                 is_null_asks = False
 
         self.metric_trackers[symbol] = self.MetricTracker(
