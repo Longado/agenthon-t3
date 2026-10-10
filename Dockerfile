@@ -26,7 +26,8 @@ COPY simulate-batch /usr/local/bin/simulate-batch
 RUN chmod +x /usr/local/bin/simulate /usr/local/bin/simulate-batch
 # Precompile bytecode: PYTHONDONTWRITEBYTECODE stops caching at runtime, so every container start
 # otherwise recompiles the adapter (and anything pip left uncompiled).
-RUN python -m compileall -q /opt/abides_fork /usr/local/lib/python3.11
+# ponytail: `|| true` because a few stdlib test fixtures are deliberately unparsable; missing .pyc only costs speed.
+RUN python -m compileall -q /opt/abides_fork /usr/local/lib/python3.11 || true
 
 WORKDIR /work
 CMD ["simulate", "--help"]
