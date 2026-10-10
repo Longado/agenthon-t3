@@ -14,7 +14,6 @@ import concurrent.futures as cf
 import datetime as dt
 import hashlib
 import json
-import os
 import pathlib
 import statistics
 import subprocess
@@ -37,12 +36,11 @@ def _sha(p: pathlib.Path) -> str | None:
 
 def run_one(image: str, scen: pathlib.Path, out_root: pathlib.Path, cpus: str, mem: str) -> dict:
     out = out_root / scen.stem
-    out.mkdir(parents=True, exist_ok=True)
-    for f in out.iterdir():
-        f.unlink()
+    # Containers run as root (as the graders do: ABIDES writes ./log under the workdir), so outputs are
+    # root-owned and cannot be cleaned up here; every bench run needs a fresh --out.
+    out.mkdir(parents=True, exist_ok=False)
     cid = subprocess.run(
         ["docker", "run", "-d", "--network", "none", f"--cpus={cpus}", f"--memory={mem}",
-         "--user", f"{os.getuid()}:{os.getgid()}",
          "-v", f"{scen}:/input/scenario.json:ro", "-v", f"{out}:/output",
          image, "simulate", "--config", "/input/scenario.json", "--out", "/output/trace.parquet"],
         check=True, capture_output=True, text=True).stdout.strip()
