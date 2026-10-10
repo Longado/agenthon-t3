@@ -13,6 +13,25 @@ from .utils import fmt_ts
 logger = logging.getLogger(__name__)
 
 
+_ATOMIC = (str, int, float, bool, type(None))
+
+
+def _copy_event(event: Any) -> Any:
+    """copy.deepcopy(event), short-circuited for the common shapes logged on hot paths.
+
+    deepcopy returns atomic values unchanged and copies a dict of atomic keys/values into a new
+    dict in the same key order, so both shortcuts give exactly what deepcopy gives."""
+    t = type(event)
+    if t in _ATOMIC:
+        return event
+    if t is dict:
+        for k, v in event.items():
+            if type(k) not in _ATOMIC or type(v) not in _ATOMIC:
+                return deepcopy(event)
+        return dict(event)
+    return deepcopy(event)
+
+
 class Agent:
     """
     Base Agent class
@@ -170,7 +189,7 @@ class Agent:
         # class instance) for both potential log targets, because we don't
         # alter logs once recorded.
         if deepcopy_event:
-            event = deepcopy(event)
+            event = _copy_event(event)
 
         self.log.append((self.current_time, event_type, event))
 

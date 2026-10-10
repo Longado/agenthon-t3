@@ -597,7 +597,7 @@ class ExchangeAgent(FinancialAgent):
             else:
                 # Hand the order to the order book for processing.
                 self.order_books[message.order.symbol].handle_limit_order(
-                    deepcopy(message.order)
+                    message.order.__deepcopy__({})
                 )
                 self.publish_order_book_data()
 
@@ -614,7 +614,7 @@ class ExchangeAgent(FinancialAgent):
             else:
                 # Hand the market order to the order book for processing.
                 self.order_books[message.order.symbol].handle_market_order(
-                    deepcopy(message.order)
+                    message.order.__deepcopy__({})
                 )
                 self.publish_order_book_data()
 
@@ -634,7 +634,7 @@ class ExchangeAgent(FinancialAgent):
             else:
                 # Hand the order to the order book for processing.
                 self.order_books[message.order.symbol].cancel_order(
-                    deepcopy(message.order), tag, metadata
+                    message.order.__deepcopy__({}), tag, metadata
                 )
                 self.publish_order_book_data()
 
@@ -655,7 +655,7 @@ class ExchangeAgent(FinancialAgent):
                 )
             else:
                 self.order_books[message.order.symbol].partial_cancel_order(
-                    deepcopy(message.order), message.quantity, tag, metadata
+                    message.order.__deepcopy__({}), message.quantity, tag, metadata
                 )
                 self.publish_order_book_data()
 
@@ -676,7 +676,7 @@ class ExchangeAgent(FinancialAgent):
                 )
             else:
                 self.order_books[old_order.symbol].modify_order(
-                    deepcopy(old_order), deepcopy(new_order)
+                    old_order.__deepcopy__({}), new_order.__deepcopy__({})
                 )
                 self.publish_order_book_data()
 
@@ -698,7 +698,7 @@ class ExchangeAgent(FinancialAgent):
                 )
             else:
                 self.order_books[order.symbol].replace_order(
-                    agent_id, deepcopy(order), deepcopy(new_order)
+                    agent_id, order.__deepcopy__({}), new_order.__deepcopy__({})
                 )
                 self.publish_order_book_data()
 

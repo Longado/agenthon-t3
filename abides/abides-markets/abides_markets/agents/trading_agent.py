@@ -558,7 +558,7 @@ class TradingAgent(FinancialAgent):
         )
 
         if order is not None:
-            self.orders[order.order_id] = deepcopy(order)
+            self.orders[order.order_id] = order.__deepcopy__({})
             self.send_message(self.exchange_id, LimitOrderMsg(order))
 
             if self.log_orders:
@@ -614,7 +614,7 @@ class TradingAgent(FinancialAgent):
                             )
                         )
                     return
-            self.orders[order.order_id] = deepcopy(order)
+            self.orders[order.order_id] = order.__deepcopy__({})
             self.send_message(self.exchange_id, MarketOrderMsg(order))
             if self.log_orders:
                 self.logEvent("ORDER_SUBMITTED", order.to_dict(), deepcopy_event=False)
@@ -650,7 +650,7 @@ class TradingAgent(FinancialAgent):
             # objects inside the order (we're halfway there) so there CAN be just a single
             # object per order, that never alters its original state, and eliminate all
             # these copies.
-            self.orders[order.order_id] = deepcopy(order)
+            self.orders[order.order_id] = order.__deepcopy__({})
 
             if self.log_orders:
                 self.logEvent("ORDER_SUBMITTED", order.to_dict(), deepcopy_event=False)

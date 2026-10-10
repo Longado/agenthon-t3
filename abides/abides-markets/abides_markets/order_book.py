@@ -124,7 +124,7 @@ class OrderBook:
                             # cancel_newest (default): cancel the incoming aggressor's remainder.
                             if not quiet:
                                 self.owner.send_message(
-                                    order.agent_id, OrderCancelledMsg(deepcopy(order))
+                                    order.agent_id, OrderCancelledMsg(order.__deepcopy__({}))
                                 )
                             break
 
@@ -140,7 +140,7 @@ class OrderBook:
 
             else:
                 # No matching order was found, so the new order enters the order book.  Notify the agent.
-                self.enter_order(deepcopy(order), quiet=quiet)
+                self.enter_order(order.__deepcopy__({}), quiet=quiet)
 
                 if logger.isEnabledFor(10):
                     logger.debug("ACCEPTED: new order {}", order)
@@ -210,7 +210,7 @@ class OrderBook:
             )
             return
 
-        order = deepcopy(order)
+        order = order.__deepcopy__({})
 
         while order.quantity > 0:
             # Self-trade prevention (opt-in; see handle_limit_order). Market orders match any resting
@@ -223,7 +223,7 @@ class OrderBook:
                         continue
                     if stp_policy != "cancel_oldest":
                         self.owner.send_message(
-                            order.agent_id, OrderCancelledMsg(deepcopy(order))
+                            order.agent_id, OrderCancelledMsg(order.__deepcopy__({}))
                         )
                         break
 
@@ -289,7 +289,7 @@ class OrderBook:
                 # Consume only part of matched order.
                 book_order, book_order_metadata = book[0].peek()
 
-                matched_order = deepcopy(book_order)
+                matched_order = book_order.__deepcopy__({})
                 matched_order.quantity = order.quantity
 
                 book_order.quantity -= matched_order.quantity
@@ -336,7 +336,7 @@ class OrderBook:
                 )
             )
 
-            filled_order = deepcopy(order)
+            filled_order = order.__deepcopy__({})
             filled_order.quantity = matched_order.quantity
             filled_order.fill_price = matched_order.fill_price
 
@@ -387,8 +387,8 @@ class OrderBook:
         if order.is_price_to_comply and (
             (metadata is None) or (metadata == {}) or ("ptc_hidden" not in metadata)
         ):
-            hidden_order = deepcopy(order)
-            visible_order = deepcopy(order)
+            hidden_order = order.__deepcopy__({})
+            visible_order = order.__deepcopy__({})
 
             hidden_order.is_hidden = True
 
@@ -596,7 +596,7 @@ class OrderBook:
             print("inside OB partialCancel")
         book = self.bids if order.side.is_bid() else self.asks
 
-        new_order = deepcopy(order)
+        new_order = order.__deepcopy__({})
         new_order.quantity -= quantity
 
         for price_level in book:

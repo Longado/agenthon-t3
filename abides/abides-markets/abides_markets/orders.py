@@ -80,7 +80,9 @@ class Order(ABC):
         self.tag: Optional[Any] = tag
 
     def to_dict(self) -> Dict[str, Any]:
-        as_dict = deepcopy(self).__dict__
+        # Speedup: call the subclass __deepcopy__ directly (what copy.deepcopy dispatches to), skipping
+        # the generic memo/keep-alive machinery. Same object, same fields.
+        as_dict = self.__deepcopy__({}).__dict__
         as_dict["time_placed"] = fmt_ts(self.time_placed)
         return as_dict
 
