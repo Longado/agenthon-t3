@@ -7,7 +7,6 @@ from typing import List, Union
 
 import numpy as np
 import pandas as pd
-from scipy.spatial.distance import pdist, squareform
 
 from abides_core import LatencyModel
 
@@ -83,6 +82,10 @@ def generate_uniform_random_pairwise_dist_on_line(
         num_points: Number of points to use.
         random_state: ``np.random.RandomState`` object.
     """
+
+    # Imported here, not at module load: scipy.spatial costs ~0.2 s per process and only scenarios
+    # without a latency_config reach this function.
+    from scipy.spatial.distance import pdist, squareform
 
     x_coords = random_state.uniform(low=left, high=right, size=num_points)
     x_coords = x_coords.reshape((x_coords.size, 1))
