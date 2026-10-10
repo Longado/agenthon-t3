@@ -54,12 +54,15 @@ def run(
 
     sim_start_time = dt.datetime.now()
 
-    logger.info(f"Simulation Start Time: {sim_start_time}")
+    if logger.isEnabledFor(20):
+        logger.info(f"Simulation Start Time: {sim_start_time}")
 
     end_state = kernel.run()
 
     sim_end_time = dt.datetime.now()
-    logger.info(f"Simulation End Time: {sim_end_time}")
-    logger.info(f"Time taken to run simulation: {sim_end_time - sim_start_time}")
+    if logger.isEnabledFor(20):
+        logger.info(f"Simulation End Time: {sim_end_time}")
+    if logger.isEnabledFor(20):
+        logger.info(f"Time taken to run simulation: {sim_end_time - sim_start_time}")
 
     return end_state

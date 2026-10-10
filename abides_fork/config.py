@@ -111,7 +111,8 @@ class ScenarioLatencyModel(LatencyModel):  # type: ignore[misc]  # untyped ABIDE
             value = base * (1.0 + self.random_state.pareto(self._alpha))
         else:
             value = self._mean_ns
-        return int(round(float(np.clip(value, self._min_ns, self._max_ns))))
+        # min/max on Python floats gives the same value as np.clip, minus the per-call numpy dispatch.
+        return int(round(float(min(max(value, self._min_ns), self._max_ns))))
 
 
 def _interval_ns(params: dict[str, Any]) -> int:

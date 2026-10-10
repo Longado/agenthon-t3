@@ -24,6 +24,9 @@ COPY abides_fork /opt/abides_fork
 COPY simulate /usr/local/bin/simulate
 COPY simulate-batch /usr/local/bin/simulate-batch
 RUN chmod +x /usr/local/bin/simulate /usr/local/bin/simulate-batch
+# Precompile bytecode: PYTHONDONTWRITEBYTECODE stops caching at runtime, so every container start
+# otherwise recompiles the adapter (and anything pip left uncompiled).
+RUN python -m compileall -q /opt/abides_fork /usr/local/lib/python3.11
 
 WORKDIR /work
 CMD ["simulate", "--help"]

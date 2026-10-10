@@ -7,6 +7,7 @@ import inspect
 import hashlib
 import os
 import pickle
+import time
 from typing import List, Dict, Any, Callable
 
 import numpy as np
@@ -75,10 +76,22 @@ def get_wake_time(open_time, close_time, a=0, b=1):
     return wake_time
 
 
+_FMT_TS_CACHE: Dict[int, str] = {}
+
+
 def fmt_ts(timestamp: NanosecondTime) -> str:
     """
     Converts a timestamp stored as nanoseconds into a human readable string.
     """
+    # Speedup: plain-int timestamps format via time.gmtime of the floored second (identical text
+    # to pandas for whole-second resolution), cached per second. Anything else takes the original path.
+    # ponytail: unbounded cache, one entry per simulated second; bound it if horizons reach days.
+    if type(timestamp) is int:
+        sec = timestamp // 1_000_000_000
+        text = _FMT_TS_CACHE.get(sec)
+        if text is None:
+            text = _FMT_TS_CACHE[sec] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(sec))
+        return text
     return pd.Timestamp(timestamp, unit="ns").strftime("%Y-%m-%d %H:%M:%S")
 
 

@@ -276,7 +276,8 @@ class AdaptiveMarketMakerAgent(TradingAgent):
 
                     self.state["AWAITING_SPREAD"] = False
                 else:
-                    logger.debug("SPREAD MISSING at time {}", current_time)
+                    if logger.isEnabledFor(10):
+                        logger.debug("SPREAD MISSING at time {}", current_time)
                     self.state[
                         "AWAITING_SPREAD"
                     ] = False  # use last mid price and spread
@@ -314,7 +315,8 @@ class AdaptiveMarketMakerAgent(TradingAgent):
 
                     self.state["AWAITING_MARKET_DATA"] = False
                 else:
-                    logger.debug("SPREAD MISSING at time {}", current_time)
+                    if logger.isEnabledFor(10):
+                        logger.debug("SPREAD MISSING at time {}", current_time)
                     self.state["AWAITING_MARKET_DATA"] = False
 
             if (
@@ -437,12 +439,13 @@ class AdaptiveMarketMakerAgent(TradingAgent):
 
         if self.backstop_quantity != 0:
             bid_price = bid_orders[0]
-            logger.debug(
-                "{}: Placing BUY limit order of size {} @ price {}",
-                self.name,
-                self.backstop_quantity,
-                bid_price,
-            )
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "{}: Placing BUY limit order of size {} @ price {}",
+                    self.name,
+                    self.backstop_quantity,
+                    bid_price,
+                )
             orders.append(
                 self.create_limit_order(
                     self.symbol, self.backstop_quantity, Side.BID, bid_price
@@ -451,12 +454,13 @@ class AdaptiveMarketMakerAgent(TradingAgent):
             bid_orders = bid_orders[1:]
 
             ask_price = ask_orders[-1]
-            logger.debug(
-                "{}: Placing SELL limit order of size {} @ price {}",
-                self.name,
-                self.backstop_quantity,
-                ask_price,
-            )
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "{}: Placing SELL limit order of size {} @ price {}",
+                    self.name,
+                    self.backstop_quantity,
+                    ask_price,
+                )
             orders.append(
                 self.create_limit_order(
                     self.symbol, self.backstop_quantity, Side.ASK, ask_price
@@ -465,12 +469,13 @@ class AdaptiveMarketMakerAgent(TradingAgent):
             ask_orders = ask_orders[:-1]
 
         for bid_price in bid_orders:
-            logger.debug(
-                "{}: Placing BUY limit order of size {} @ price {}",
-                self.name,
-                self.buy_order_size,
-                bid_price,
-            )
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "{}: Placing BUY limit order of size {} @ price {}",
+                    self.name,
+                    self.buy_order_size,
+                    bid_price,
+                )
             orders.append(
                 self.create_limit_order(
                     self.symbol, self.buy_order_size, Side.BID, bid_price
@@ -478,12 +483,13 @@ class AdaptiveMarketMakerAgent(TradingAgent):
             )
 
         for ask_price in ask_orders:
-            logger.debug(
-                "{}: Placing SELL limit order of size {} @ price {}",
-                self.name,
-                self.sell_order_size,
-                ask_price,
-            )
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "{}: Placing SELL limit order of size {} @ price {}",
+                    self.name,
+                    self.sell_order_size,
+                    ask_price,
+                )
             orders.append(
                 self.create_limit_order(
                     self.symbol, self.sell_order_size, Side.ASK, ask_price

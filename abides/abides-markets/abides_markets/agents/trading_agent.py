@@ -165,9 +165,10 @@ class TradingAgent(FinancialAgent):
         # to exist by now (if there is one).
         self.exchange_id: int = self.kernel.find_agents_by_type(ExchangeAgent)[0]
 
-        logger.debug(
-            f"Agent {self.id} requested agent of type Agent.ExchangeAgent.  Given Agent ID: {self.exchange_id}"
-        )
+        if logger.isEnabledFor(10):
+            logger.debug(
+                f"Agent {self.id} requested agent of type Agent.ExchangeAgent.  Given Agent ID: {self.exchange_id}"
+            )
 
         # Request a wake-up call as in the base Agent.
         super().kernel_starting(start_time)
@@ -188,11 +189,12 @@ class TradingAgent(FinancialAgent):
         cash = self.mark_to_market(self.holdings)
 
         self.logEvent("ENDING_CASH", cash, True)
-        logger.debug(
-            "Final holdings for {}: {}. Marked to market: {}".format(
-                self.name, self.fmt_holdings(self.holdings), cash
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "Final holdings for {}: {}. Marked to market: {}".format(
+                    self.name, self.fmt_holdings(self.holdings), cash
+                )
             )
-        )
 
         # Record final results for presentation/debugging.  This is an ugly way
         # to do this, but it is useful for now.
@@ -287,8 +289,10 @@ class TradingAgent(FinancialAgent):
             self.mkt_open = message.mkt_open
             self.mkt_close = message.mkt_close
 
-            logger.debug("Recorded market open: {}".format(fmt_ts(self.mkt_open)))
-            logger.debug("Recorded market close: {}".format(fmt_ts(self.mkt_close)))
+            if logger.isEnabledFor(10):
+                logger.debug("Recorded market open: {}".format(fmt_ts(self.mkt_open)))
+            if logger.isEnabledFor(10):
+                logger.debug("Recorded market close: {}".format(fmt_ts(self.mkt_close)))
 
         elif isinstance(message, MarketClosePriceMsg):
             # Update our local last trade prices with the accurate last trade prices from
@@ -494,11 +498,12 @@ class TradingAgent(FinancialAgent):
                 new_at_risk = self.mark_to_market(new_holdings) - new_holdings["CASH"]
 
                 if (new_at_risk > at_risk) and (new_at_risk > self.starting_cash):
-                    logger.debug(
-                        "TradingAgent ignored limit order due to at-risk constraints: {}\n{}".format(
-                            order, self.fmt_holdings(self.holdings)
+                    if logger.isEnabledFor(10):
+                        logger.debug(
+                            "TradingAgent ignored limit order due to at-risk constraints: {}\n{}".format(
+                                order, self.fmt_holdings(self.holdings)
+                            )
                         )
-                    )
                     return
 
             return order
@@ -602,11 +607,12 @@ class TradingAgent(FinancialAgent):
                 new_at_risk = self.mark_to_market(new_holdings) - new_holdings["CASH"]
 
                 if (new_at_risk > at_risk) and (new_at_risk > self.starting_cash):
-                    logger.debug(
-                        "TradingAgent ignored market order due to at-risk constraints: {}\n{}".format(
-                            order, self.fmt_holdings(self.holdings)
+                    if logger.isEnabledFor(10):
+                        logger.debug(
+                            "TradingAgent ignored market order due to at-risk constraints: {}\n{}".format(
+                                order, self.fmt_holdings(self.holdings)
+                            )
                         )
-                    )
                     return
             self.orders[order.order_id] = deepcopy(order)
             self.send_message(self.exchange_id, MarketOrderMsg(order))
@@ -754,7 +760,8 @@ class TradingAgent(FinancialAgent):
             order: The order that has been executed by the exchange.
         """
 
-        logger.debug(f"Received notification of execution for: {order}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"Received notification of execution for: {order}")
 
         if self.log_orders:
             self.logEvent("ORDER_EXECUTED", order.to_dict(), deepcopy_event=False)
@@ -789,7 +796,8 @@ class TradingAgent(FinancialAgent):
         else:
             warnings.warn(f"Execution received for order not in orders list: {order}")
 
-        logger.debug(f"After order execution, agent open orders: {self.orders}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"After order execution, agent open orders: {self.orders}")
 
         self.logEvent("HOLDINGS_UPDATED", self.holdings)
 
@@ -803,7 +811,8 @@ class TradingAgent(FinancialAgent):
             order: The order that has been accepted from the exchange.
         """
 
-        logger.debug(f"Received notification of acceptance for: {order}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"Received notification of acceptance for: {order}")
 
         if self.log_orders:
             self.logEvent("ORDER_ACCEPTED", order.to_dict(), deepcopy_event=False)
@@ -821,7 +830,8 @@ class TradingAgent(FinancialAgent):
             order: The order that has been cancelled by the exchange.
         """
 
-        logger.debug(f"Received notification of cancellation for: {order}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"Received notification of cancellation for: {order}")
 
         if self.log_orders:
             self.logEvent("ORDER_CANCELLED", order.to_dict(), deepcopy_event=False)
@@ -846,7 +856,8 @@ class TradingAgent(FinancialAgent):
             order: The order that has been partially cancelled by the exchange.
         """
 
-        logger.debug(f"Received notification of partial cancellation for: {order}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"Received notification of partial cancellation for: {order}")
 
         if self.log_orders:
             self.logEvent("PARTIAL_CANCELLED", order.to_dict())
@@ -861,9 +872,10 @@ class TradingAgent(FinancialAgent):
                 f"partial cancellation received for order not in orders list: {order}"
             )
 
-        logger.debug(
-            f"After order partial cancellation, agent open orders: {self.orders}"
-        )
+        if logger.isEnabledFor(10):
+            logger.debug(
+                f"After order partial cancellation, agent open orders: {self.orders}"
+            )
 
         self.logEvent("HOLDINGS_UPDATED", self.holdings)
 
@@ -877,7 +889,8 @@ class TradingAgent(FinancialAgent):
             order: The order that has been modified at the exchange.
         """
 
-        logger.debug(f"Received notification of modification for: {order}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"Received notification of modification for: {order}")
 
         if self.log_orders:
             self.logEvent("ORDER_MODIFIED", order.to_dict())
@@ -890,7 +903,8 @@ class TradingAgent(FinancialAgent):
         else:
             warnings.warn("Execution received for order not in orders list: {order}")
 
-        logger.debug(f"After order modification, agent open orders: {self.orders}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"After order modification, agent open orders: {self.orders}")
 
         self.logEvent("HOLDINGS_UPDATED", self.holdings)
 
@@ -904,7 +918,8 @@ class TradingAgent(FinancialAgent):
             order: The order that has been modified at the exchange.
         """
 
-        logger.debug(f"Received notification of replacement for: {old_order}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"Received notification of replacement for: {old_order}")
 
         if self.log_orders:
             self.logEvent("ORDER_REPLACED", old_order.to_dict())
@@ -920,7 +935,8 @@ class TradingAgent(FinancialAgent):
 
         self.orders[new_order.order_id] = new_order
 
-        logger.debug(f"After order replacement, agent open orders: {self.orders}")
+        if logger.isEnabledFor(10):
+            logger.debug(f"After order replacement, agent open orders: {self.orders}")
 
         # After execution, log holdings.
         self.logEvent("HOLDINGS_UPDATED", self.holdings)
@@ -932,7 +948,8 @@ class TradingAgent(FinancialAgent):
         Subclasses may wish to extend.
         """
 
-        logger.debug("Received notification of market closure.")
+        if logger.isEnabledFor(10):
+            logger.debug("Received notification of market closure.")
 
         # Log this activity.
         self.logEvent("MKT_CLOSED")
@@ -951,21 +968,23 @@ class TradingAgent(FinancialAgent):
 
         self.last_trade[symbol] = price
 
-        logger.debug(
-            "Received last trade price of {} for {}.".format(
-                self.last_trade[symbol], symbol
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "Received last trade price of {} for {}.".format(
+                    self.last_trade[symbol], symbol
+                )
             )
-        )
 
         if self.mkt_closed:
             # Note this as the final price of the day.
             self.daily_close_price[symbol] = self.last_trade[symbol]
 
-            logger.debug(
-                "Received daily close price of {} for {}.".format(
-                    self.last_trade[symbol], symbol
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "Received daily close price of {} for {}.".format(
+                        self.last_trade[symbol], symbol
+                    )
                 )
-            )
 
     def query_spread(
         self,
@@ -1002,11 +1021,12 @@ class TradingAgent(FinancialAgent):
         else:
             best_ask, best_ask_qty = ("No asks", 0)
 
-        logger.debug(
-            "Received spread of {} @ {} / {} @ {} for {}".format(
-                best_bid_qty, best_bid, best_ask_qty, best_ask, symbol
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "Received spread of {} @ {} / {} @ {} for {}".format(
+                    best_bid_qty, best_bid, best_ask_qty, best_ask, symbol
+                )
             )
-        )
 
         self.logEvent("BID_DEPTH", bids)
         self.logEvent("ASK_DEPTH", asks)
@@ -1106,9 +1126,12 @@ class TradingAgent(FinancialAgent):
         bid_liq = self.get_book_liquidity(self.known_bids[symbol], within)
         ask_liq = self.get_book_liquidity(self.known_asks[symbol], within)
 
-        logger.debug("Bid/ask liq: {}, {}".format(bid_liq, ask_liq))
-        logger.debug("Known bids: {}".format(self.known_bids[self.symbol]))
-        logger.debug("Known asks: {}".format(self.known_asks[self.symbol]))
+        if logger.isEnabledFor(10):
+            logger.debug("Bid/ask liq: {}, {}".format(bid_liq, ask_liq))
+        if logger.isEnabledFor(10):
+            logger.debug("Known bids: {}".format(self.known_bids[self.symbol]))
+        if logger.isEnabledFor(10):
+            logger.debug("Known asks: {}".format(self.known_asks[self.symbol]))
 
         return bid_liq, ask_liq
 
@@ -1127,11 +1150,12 @@ class TradingAgent(FinancialAgent):
 
             # Is this price within "within" proportion of the best price?
             if abs(best - price) <= int(round(best * within)):
-                logger.debug(
-                    "Within {} of {}: {} with {} shares".format(
-                        within, best, price, shares
+                if logger.isEnabledFor(10):
+                    logger.debug(
+                        "Within {} of {}: {} with {} shares".format(
+                            within, best, price, shares
+                        )
                     )
-                )
                 liq += shares
 
         return liq

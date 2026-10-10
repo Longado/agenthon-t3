@@ -49,15 +49,18 @@ class MeanRevertingOracle(Oracle):
 
         for symbol in symbols:
             s = symbols[symbol]
-            logger.debug(
-                "MeanRevertingOracle computing fundamental value series for {}", symbol
-            )
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "MeanRevertingOracle computing fundamental value series for {}", symbol
+                )
             self.r[symbol] = self.generate_fundamental_value_series(symbol=symbol, **s)
 
         now = dt.datetime.now()
 
-        logger.debug("MeanRevertingOracle initialized for symbols {}", symbols)
-        logger.debug("MeanRevertingOracle initialization took {}", now - then)
+        if logger.isEnabledFor(10):
+            logger.debug("MeanRevertingOracle initialized for symbols {}", symbols)
+        if logger.isEnabledFor(10):
+            logger.debug("MeanRevertingOracle initialization took {}", now - then)
 
     def generate_fundamental_value_series(
         self, symbol: str, r_bar: int, kappa: float, sigma_s: float
@@ -116,12 +119,14 @@ class MeanRevertingOracle(Oracle):
         if (mkt_open is not None) and (self.mkt_open is None):
             self.mkt_open = mkt_open
 
-        logger.debug(
-            "Oracle: client requested {symbol} at market open: {}", self.mkt_open
-        )
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "Oracle: client requested {symbol} at market open: {}", self.mkt_open
+            )
 
         open_price = self.r[symbol].loc[self.mkt_open]
-        logger.debug("Oracle: market open price was was {}", open_price)
+        if logger.isEnabledFor(10):
+            logger.debug("Oracle: market open price was was {}", open_price)
 
         return open_price
 
@@ -159,8 +164,10 @@ class MeanRevertingOracle(Oracle):
         else:
             obs = int(round(random_state.normal(loc=r_t, scale=sqrt(sigma_n))))
 
-        logger.debug("Oracle: current fundamental value is {} at {}", r_t, current_time)
-        logger.debug("Oracle: giving client value observation {}", obs)
+        if logger.isEnabledFor(10):
+            logger.debug("Oracle: current fundamental value is {} at {}", r_t, current_time)
+        if logger.isEnabledFor(10):
+            logger.debug("Oracle: giving client value observation {}", obs)
 
         # Reminder: all simulator prices are specified in integer cents.
         return obs

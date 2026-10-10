@@ -90,7 +90,8 @@ class Agent:
 
         self.kernel = kernel
 
-        logger.debug("{} exists!".format(self.name))
+        if logger.isEnabledFor(10):
+            logger.debug("{} exists!".format(self.name))
 
     def kernel_starting(self, start_time: NanosecondTime) -> None:
         """
@@ -108,11 +109,12 @@ class Agent:
 
         assert self.kernel is not None
 
-        logger.debug(
-            "Agent {} ({}) requesting kernel wakeup at time {}".format(
-                self.id, self.name, fmt_ts(start_time)
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "Agent {} ({}) requesting kernel wakeup at time {}".format(
+                    self.id, self.name, fmt_ts(start_time)
+                )
             )
-        )
 
         self.set_wakeup(start_time)
 
@@ -199,11 +201,12 @@ class Agent:
         self.current_time = current_time
 
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "At {}, agent {} ({}) received: {}".format(
-                    fmt_ts(current_time), self.id, self.name, message
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "At {}, agent {} ({}) received: {}".format(
+                        fmt_ts(current_time), self.id, self.name, message
+                    )
                 )
-            )
 
     def wakeup(self, current_time: NanosecondTime) -> None:
         """
@@ -222,11 +225,12 @@ class Agent:
         self.current_time = current_time
 
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "At {}, agent {} ({}) received wakeup.".format(
-                    fmt_ts(current_time), self.id, self.name
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "At {}, agent {} ({}) received wakeup.".format(
+                        fmt_ts(current_time), self.id, self.name
+                    )
                 )
-            )
 
     ### Presently the kernel expects agent IDs only, not agent references.
     ### It is possible this could change in the future.  Normal agents will

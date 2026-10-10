@@ -69,11 +69,12 @@ class SparseMeanRevertingOracle(MeanRevertingOracle):
         # which the series was computed and the true fundamental value at that time.
         for symbol in symbols:
             s = symbols[symbol]
-            logger.debug(
-                "SparseMeanRevertingOracle computing initial fundamental value for {}".format(
-                    symbol
+            if logger.isEnabledFor(10):
+                logger.debug(
+                    "SparseMeanRevertingOracle computing initial fundamental value for {}".format(
+                        symbol
+                    )
                 )
-            )
             self.r[symbol] = (mkt_open, s["r_bar"])
             self.f_log[symbol] = [
                 {"FundamentalTime": mkt_open, "FundamentalValue": s["r_bar"]}
@@ -93,12 +94,14 @@ class SparseMeanRevertingOracle(MeanRevertingOracle):
 
         now = dt.datetime.now()
 
-        logger.debug(
-            "SparseMeanRevertingOracle initialized for symbols {}".format(symbols)
-        )
-        logger.debug(
-            "SparseMeanRevertingOracle initialization took {}".format(now - then)
-        )
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "SparseMeanRevertingOracle initialized for symbols {}".format(symbols)
+            )
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "SparseMeanRevertingOracle initialization took {}".format(now - then)
+            )
 
     def compute_fundamental_at_timestamp(
         self, ts: NanosecondTime, v_adj, symbol: str, pt: NanosecondTime, pv
@@ -243,14 +246,16 @@ class SparseMeanRevertingOracle(MeanRevertingOracle):
         # advances on demand keeping only the most recent price, except for the opening
         # price.  Thus we cannot honor a mkt_open that isn't what we already expected.
 
-        logger.debug(
-            "Oracle: client requested {} at market open: {}".format(
-                symbol, self.mkt_open
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "Oracle: client requested {} at market open: {}".format(
+                    symbol, self.mkt_open
+                )
             )
-        )
 
         open_price = self.symbols[symbol]["r_bar"]
-        logger.debug("Oracle: market open price was was {}".format(open_price))
+        if logger.isEnabledFor(10):
+            logger.debug("Oracle: market open price was was {}".format(open_price))
 
         return open_price
 
@@ -288,10 +293,12 @@ class SparseMeanRevertingOracle(MeanRevertingOracle):
         else:
             obs = int(round(random_state.normal(loc=r_t, scale=sqrt(sigma_n))))
 
-        logger.debug(
-            "Oracle: current fundamental value is {} at {}".format(r_t, current_time)
-        )
-        logger.debug("Oracle: giving client value observation {}".format(obs))
+        if logger.isEnabledFor(10):
+            logger.debug(
+                "Oracle: current fundamental value is {} at {}".format(r_t, current_time)
+            )
+        if logger.isEnabledFor(10):
+            logger.debug("Oracle: giving client value observation {}".format(obs))
 
         # Reminder: all simulator prices are specified in integer cents.
         return obs
