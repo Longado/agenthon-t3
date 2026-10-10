@@ -937,7 +937,8 @@ class ExchangeAgent(FinancialAgent):
 
         # Same walk as the original DataFrame.iterrows() loop, over the compact
         # (QuoteTime, bids_empty, asks_empty) rows that OrderBook.append_book_log2 now records.
-        total_time = book[-1][0] - book[0][0]
+        # np.int64 keeps the original's numpy division (nan/inf, no exception) when total_time == 0.
+        total_time = np.int64(book[-1][0] - book[0][0])
         is_null_bids = False
         t_null_bids_first = 0
         T_null_bids = 0
