@@ -1,2 +1,4 @@
 bench/
+tools/
+.github/
 __pycache__/
