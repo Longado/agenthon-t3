@@ -101,6 +101,46 @@ def _side_to_str(value: Any) -> str | None:
     return None
 
 
+# Event types that can reach the trace: order lifecycle (incl. fills) and best-quote updates.
+_TRACE_EVENT_TYPES = frozenset({*_ORDER_EVENT_MAP, "ORDER_EXECUTED", "BEST_BID", "BEST_ASK"})
+
+
+def _parse_trace_logs(end_state: dict[str, Any]) -> pd.DataFrame:
+    """``abides_core.utils.parse_logs_df`` restricted to ``_TRACE_EVENT_TYPES`` rows.
+
+    Row construction is copied from parse_logs_df; only the per-row type filter is new. Every
+    later step of extract_trace keeps only rows of these types, so the selected rows and their
+    order are unchanged. Dropping the other rows can change a shared column's inferred dtype
+    (e.g. int64 instead of float64 with NaN), never a value, and every trace column is cast to its
+    canonical dtype at the end. Logged dicts never carry an ``EventType`` key, so filtering on
+    the log entry's own type is exact.
+    """
+    dfs = []
+    for agent in end_state["agents"]:
+        messages = []
+        for m in agent.log:
+            if m[1] not in _TRACE_EVENT_TYPES:
+                continue
+            m = {
+                "EventTime": m[0] if isinstance(m[0], (int, np.int64)) else 0,
+                "EventType": m[1],
+                "Event": m[2],
+            }
+            event = m.get("Event", None)
+            if event == None:  # noqa: E711 — kept verbatim from parse_logs_df
+                event = {"EmptyEvent": True}
+            elif not isinstance(event, dict):
+                event = {"ScalarEventValue": event}
+            del m["Event"]
+            m.update(event)
+            if m.get("agent_id") == None:  # noqa: E711
+                m["agent_id"] = agent.id
+            m["agent_type"] = agent.type
+            messages.append(m)
+        dfs.append(pd.DataFrame(messages))
+    return pd.concat(dfs)
+
+
 def extract_trace(end_state: dict[str, Any]) -> pd.DataFrame:
     """Build the canonical 7-column trace DataFrame from an ABIDES ``end_state``.
 
@@ -111,7 +151,10 @@ def extract_trace(end_state: dict[str, Any]) -> pd.DataFrame:
         A DataFrame with columns ``TRACE_COLUMNS`` and canonical dtypes, sorted by
         ``(t_ns, order_id)``.
     """
-    raw = parse_logs_df(end_state)
+    raw = _parse_trace_logs(end_state)
+    if "order_id" not in raw.columns:
+        # Degenerate run with no order rows: defer to the original full-log path.
+        raw = parse_logs_df(end_state)
 
     # --- order-lifecycle events (rows carrying an order_id), vectorized ---------
     # parse_logs_df returns a non-unique index (per-agent row numbers); sort by

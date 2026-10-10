@@ -155,7 +155,9 @@ class Agent:
 
         # If this agent has been maintaining a log, convert it to a Dataframe
         # and request that the Kernel write it to disk before terminating.
-        if self.log and self.log_to_file:
+        # Speedup: Kernel.write_log returns immediately when skip_log is set (the default), so the
+        # DataFrame built here would be discarded; skip building it in that case.
+        if self.log and self.log_to_file and not getattr(self.kernel, "skip_log", False):
             df_log = pd.DataFrame(self.log, columns=("EventTime", "EventType", "Event"))
             df_log.set_index("EventTime", inplace=True)
             self.write_log(df_log)
