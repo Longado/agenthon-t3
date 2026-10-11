@@ -1,6 +1,15 @@
 # Track 3 submission image: ABIDES (pinned commit f9cbe51 + the 4 official patches, vendored under
 # abides/) with output-preserving speedups, plus the official `abides_fork` simulate adapter.
 # Same Python and dependency pins as the official baseline image, so RNG streams and float math match.
+# The native engine (native/, Rust) reproduces the baseline bit-for-bit on supported scenarios and
+# hands anything else to the Python adapter, so `simulate` / `simulate-batch` are the Rust binary.
+# Built on the same Debian release as the runtime base so it links the same glibc/libm.
+FROM --platform=linux/amd64 rust:1.98-slim-trixie AS native
+WORKDIR /src
+COPY native/Cargo.toml native/Cargo.lock ./
+COPY native/src ./src
+RUN cargo build --release --locked --bin t3sim
+
 FROM --platform=linux/amd64 python:3.11-slim
 
 LABEL qfbench2.interface_version="2.0"
@@ -21,9 +30,8 @@ COPY abides /tmp/abides
 RUN pip install --no-deps /tmp/abides/abides-core /tmp/abides/abides-markets && rm -rf /tmp/abides
 
 COPY abides_fork /opt/abides_fork
-COPY simulate /usr/local/bin/simulate
-COPY simulate-batch /usr/local/bin/simulate-batch
-RUN chmod +x /usr/local/bin/simulate /usr/local/bin/simulate-batch
+COPY --from=native /src/target/release/t3sim /usr/local/bin/simulate
+RUN ln -s simulate /usr/local/bin/simulate-batch
 # Precompile bytecode: PYTHONDONTWRITEBYTECODE stops caching at runtime, so every container start
 # otherwise recompiles the adapter (and anything pip left uncompiled).
 # ponytail: `|| true` because a few stdlib test fixtures are deliberately unparsable; missing .pyc only costs speed.

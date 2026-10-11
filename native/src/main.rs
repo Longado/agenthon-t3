@@ -1,0 +1,228 @@
+//! `simulate` / `simulate-batch` for the Track 3 image. Runs the native engine when the scenario
+//! is fully supported; otherwise replaces itself with the Python ABIDES baseline (same arguments).
+
+mod output;
+mod rng;
+mod scenario;
+mod sim;
+
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
+
+use serde_json::{json, Value};
+
+/// Hand the whole invocation to the Python baseline adapter; never returns on success.
+fn fallback(module: &str, args: &[String], why: &str) -> ! {
+    if std::env::var_os("T3SIM_NO_FALLBACK").is_some() {
+        eprintln!("t3sim: unsupported ({why})");
+        std::process::exit(3);
+    }
+    eprintln!("t3sim: falling back to python ({why})");
+    let err = Command::new("python").arg("-m").arg(module).args(args).exec();
+    eprintln!("t3sim: cannot exec python: {err}");
+    std::process::exit(2);
+}
+
+fn peak_rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
+struct Prepared {
+    cfg: scenario::Config,
+    seed: i64,
+}
+
+fn prepare(config_path: &Path, seed: Option<i64>) -> Result<Prepared, String> {
+    let text = std::fs::read_to_string(config_path).map_err(|e| format!("read {}: {e}", config_path.display()))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("json: {e}"))?;
+    let cfg = scenario::build(&v, seed).map_err(|u| u.0)?;
+    Ok(Prepared { seed: cfg.seed as i64, cfg })
+}
+
+/// Run one prepared scenario and write trace.parquet, message_trace.parquet, events.json.
+fn run_one(p: Prepared, trace_path: &Path) -> std::io::Result<Value> {
+    let t0 = Instant::now();
+    let scenario_id = p.cfg.scenario_id.clone();
+    let mut s = sim::Sim::new(p.cfg);
+    s.run();
+    let t_run = t0.elapsed();
+    let out = s.outputs();
+    let t_asm = t0.elapsed();
+    let dir = trace_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+    let msg_path = dir.join("message_trace.parquet");
+    std::thread::scope(|sc| -> std::io::Result<()> {
+        let h = sc.spawn(|| output::write_message_trace(&msg_path, &out.msgs));
+        output::write_trace(trace_path, &out.trace)?;
+        h.join().expect("writer thread panicked")
+    })?;
+    if std::env::var_os("T3SIM_TIMING").is_some() {
+        eprintln!("t3sim timing: run {:?} assemble {:?} write {:?}", t_run, t_asm - t_run, t0.elapsed() - t_asm);
+    }
+    let n_events = out.trace.t_ns.len() as u64;
+    let n_messages = out.msgs.seq.len() as u64;
+    let wall = t0.elapsed().as_secs_f64();
+    let events = json!({
+        "scenario_id": scenario_id,
+        "seed": p.seed,
+        "n_events": n_events,
+        "wall_clock_sec": wall,
+        "events_per_sec": if wall > 0.0 { n_events as f64 / wall } else { 0.0 },
+        "trace_sha256": output::sha256_file(trace_path)?,
+        "n_messages": n_messages,
+        "message_trace_sha256": output::sha256_file(&msg_path)?,
+        "peak_memory_bytes": peak_rss_bytes(),
+        "gpu_seconds": 0.0,
+    });
+    std::fs::write(dir.join("events.json"), serde_json::to_string_pretty(&events)? + "\n")?;
+    Ok(events)
+}
+
+fn arg_value(args: &[String], flag: &str) -> Option<String> {
+    let eq = format!("{flag}=");
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == flag {
+            return it.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix(&eq) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn cmd_simulate(args: &[String]) {
+    let py = "abides_fork.simulate";
+    let (Some(config), Some(out)) = (arg_value(args, "--config"), arg_value(args, "--out")) else {
+        fallback(py, args, "missing --config/--out");
+    };
+    let seed = match arg_value(args, "--seed") {
+        Some(s) => match s.parse::<i64>() {
+            Ok(v) => Some(v),
+            Err(_) => fallback(py, args, "unparsed --seed"),
+        },
+        None => None,
+    };
+    let prepared = match prepare(Path::new(&config), seed) {
+        Ok(p) => p,
+        Err(why) => fallback(py, args, &why),
+    };
+    match run_one(prepared, Path::new(&out)) {
+        Ok(ev) => println!("{ev}"),
+        Err(e) => {
+            eprintln!("t3sim: write failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_batch(args: &[String]) {
+    let py = "abides_fork.simulate_batch";
+    let (Some(batch_dir), Some(out_dir)) = (arg_value(args, "--batch-dir"), arg_value(args, "--out-dir")) else {
+        fallback(py, args, "missing --batch-dir/--out-dir");
+    };
+    let t0 = Instant::now();
+    let mut subs: Vec<PathBuf> = match std::fs::read_dir(&batch_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .collect(),
+        Err(e) => fallback(py, args, &format!("read batch dir: {e}")),
+    };
+    // Python sorts the paths; within one directory that is byte order of the file names.
+    subs.sort();
+    if subs.is_empty() {
+        fallback(py, args, "no sub-scenarios");
+    }
+    let mut prepared = Vec::with_capacity(subs.len());
+    for p in &subs {
+        match prepare(p, None) {
+            Ok(x) => prepared.push(x),
+            Err(why) => fallback(py, args, &format!("{}: {why}", p.display())),
+        }
+    }
+    let out_dir = PathBuf::from(out_dir);
+    let names: Vec<String> = subs.iter().map(|p| p.file_stem().unwrap().to_string_lossy().into_owned()).collect();
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(prepared.len());
+    // Subs are independent simulations; run them on all available cores, results kept in sub order.
+    let jobs: Vec<(usize, Prepared)> = prepared.into_iter().enumerate().collect();
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    let results: Vec<std::sync::Mutex<Option<std::io::Result<Value>>>> = (0..names.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..workers {
+            sc.spawn(|| loop {
+                let next = queue.lock().unwrap().next();
+                let Some((i, p)) = next else { break };
+                let r = run_one(p, &out_dir.join(&names[i]).join("trace.parquet"));
+                *results[i].lock().unwrap() = Some(r);
+            });
+        }
+    });
+    let mut per = Vec::new();
+    let mut total: u64 = 0;
+    for (i, r) in results.into_iter().enumerate() {
+        match r.into_inner().unwrap().unwrap() {
+            Ok(ev) => {
+                let n = ev["n_events"].as_u64().unwrap();
+                total += n;
+                per.push(json!({"sub": names[i], "n_events": n, "trace_sha256": ev["trace_sha256"]}));
+            }
+            Err(e) => {
+                eprintln!("t3sim: sub {} failed: {e}", names[i]);
+                std::process::exit(1);
+            }
+        }
+    }
+    let wall = t0.elapsed().as_secs_f64();
+    let agg = json!({
+        "n_scenarios": names.len(),
+        "total_events": total,
+        "wall_clock_sec": wall,
+        "events_per_sec": if wall > 0.0 { total as f64 / wall } else { 0.0 },
+        "peak_memory_bytes": peak_rss_bytes(),
+        "gpu_seconds": 0.0,
+        "per_scenario": per,
+    });
+    if let Err(e) = std::fs::create_dir_all(&out_dir)
+        .and_then(|_| std::fs::write(out_dir.join("batch_events.json"), serde_json::to_string_pretty(&agg).unwrap() + "\n"))
+    {
+        eprintln!("t3sim: write batch_events.json: {e}");
+        std::process::exit(1);
+    }
+    println!("{agg}");
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    let prog = Path::new(&argv[0]).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut args: Vec<String> = argv[1..].to_vec();
+    // Accept both `simulate --config ...` (verb as argument) and a binary named after the verb.
+    let verb = match args.first().map(String::as_str) {
+        Some("simulate") | Some("simulate-batch") => args.remove(0),
+        _ => prog,
+    };
+    match verb.as_str() {
+        "simulate-batch" => {
+            let mut a = vec!["simulate-batch".to_string()];
+            a.extend(args);
+            cmd_batch(&a)
+        }
+        _ => {
+            let mut a = vec!["simulate".to_string()];
+            a.extend(args);
+            cmd_simulate(&a)
+        }
+    }
+}
