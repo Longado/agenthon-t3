@@ -816,13 +816,17 @@ impl Sim {
         match self.free_slots.pop() {
             Some(s) => {
                 self.slots[s as usize] = m;
-                self.slot_rows[s as usize] = row;
+                if self.ledger {
+                    self.slot_rows[s as usize] = row; // send-time fields only the ledger needs
+                }
                 s
             }
             None => {
                 assert!(self.slots.len() < FRONT as usize, "message slots exhausted");
                 self.slots.push(m);
-                self.slot_rows.push(row);
+                if self.ledger {
+                    self.slot_rows.push(row);
+                }
                 (self.slots.len() - 1) as u32
             }
         }
@@ -1016,17 +1020,19 @@ impl Sim {
             } else {
                 self.agent_times[r] += self.comp_delay[r];
                 self.causal = Some(e.msg_id());
-                let w = self.slot_rows[slot as usize];
-                self.push_msg(MsgRow {
-                    message_id: e.msg_id(),
-                    t_send: w.t_send,
-                    t_recv: w.t_recv,
-                    order_id: w.order_id,
-                    causal: w.causal,
-                    src: e.sender(),
-                    dst: e.recipient(),
-                    msg_type: w.msg_type,
-                });
+                if self.ledger {
+                    let w = self.slot_rows[slot as usize];
+                    self.push_msg(MsgRow {
+                        message_id: e.msg_id(),
+                        t_send: w.t_send,
+                        t_recv: w.t_recv,
+                        order_id: w.order_id,
+                        causal: w.causal,
+                        src: e.sender(),
+                        dst: e.recipient(),
+                        msg_type: w.msg_type,
+                    });
+                }
                 self.receive(e.recipient(), e.time, e.sender(), msg);
             }
             if was_front {
