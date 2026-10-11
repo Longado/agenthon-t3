@@ -599,8 +599,13 @@ fn assemble(
         start = end;
     }
     w.close().map_err(err)?;
-    std::fs::write(path, &file)?;
-    Ok(hex(&Sha256::digest(&file)))
+    // Hash and write the same bytes concurrently: both are single-threaded passes over the file.
+    let (written, sha) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| hex(&Sha256::digest(&file)));
+        (std::fs::write(path, &file), h.join().expect("hash thread panicked"))
+    });
+    written?;
+    Ok(sha)
 }
 
 fn hex(d: &[u8]) -> String {
