@@ -54,31 +54,38 @@ fn prepare(config_path: &Path, seed: Option<i64>) -> Result<Prepared, String> {
     Ok(Prepared { seed: cfg.seed as i64, cfg })
 }
 
-/// Run one prepared scenario and write trace.parquet, message_trace.parquet, events.json.
-/// `threads` is this scenario's CPU budget; `leak` skips freeing the simulation state (the
-/// process is about to exit, and unmapping hundreds of MB is measurable). Ok(None): the run
-/// emitted trace events out of time order, nothing was written, and the caller must fall back.
-fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::io::Result<Option<Value>> {
+/// Run one prepared scenario and write trace.parquet, events.json and, when `ledger`,
+/// message_trace.parquet. `threads` is this scenario's CPU budget; `leak` skips freeing the
+/// simulation state (the process is about to exit, and unmapping hundreds of MB is measurable).
+/// Ok(None): the run emitted trace events out of time order, nothing was written, and the caller
+/// must fall back.
+fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool, ledger: bool) -> std::io::Result<Option<Value>> {
     let t0 = Instant::now();
     let scenario_id = p.cfg.scenario_id.clone();
     let mut s = sim::Sim::new(p.cfg);
-    // message_trace pages are encoded by `threads - 1` helpers while the simulation runs; the
-    // main thread drains whatever is left once it finishes.
-    let (tx, rx) = mpsc::channel();
-    let (rx, pages, rows) = (Mutex::new(rx), Mutex::new(Vec::new()), AtomicUsize::new(0));
     let mut t_sim = Default::default();
-    std::thread::scope(|sc| {
-        for _ in 1..threads {
-            sc.spawn(|| sim::MessagePages::work(&rx, &pages, &rows));
-        }
-        s.run(tx);
+    let msg_pages = if ledger {
+        // message_trace pages are encoded by `threads - 1` helpers while the simulation runs; the
+        // main thread drains whatever is left once it finishes.
+        let (tx, rx) = mpsc::channel();
+        let (rx, pages, rows) = (Mutex::new(rx), Mutex::new(Vec::new()), AtomicUsize::new(0));
+        std::thread::scope(|sc| {
+            for _ in 1..threads {
+                sc.spawn(|| sim::MessagePages::work(&rx, &pages, &rows));
+            }
+            s.run(Some(tx));
+            t_sim = t0.elapsed();
+            sim::MessagePages::work(&rx, &pages, &rows);
+        });
+        Some(sim::MessagePages::finish(pages, rows))
+    } else {
+        s.run(None);
         t_sim = t0.elapsed();
-        sim::MessagePages::work(&rx, &pages, &rows);
-    });
+        None
+    };
     if s.disordered() {
         return Ok(None);
     }
-    let msg_pages = sim::MessagePages::finish(pages, rows);
     let t_run = t0.elapsed();
     let dir = trace_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
@@ -90,20 +97,45 @@ fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::i
         std::mem::forget(s);
     }
     let wall = t0.elapsed().as_secs_f64();
-    let events = json!({
+    let mut events = json!({
         "scenario_id": scenario_id,
         "seed": p.seed,
         "n_events": w.n_events,
         "wall_clock_sec": wall,
         "events_per_sec": if wall > 0.0 { w.n_events as f64 / wall } else { 0.0 },
         "trace_sha256": w.trace_sha,
-        "n_messages": w.n_messages,
-        "message_trace_sha256": w.message_sha,
         "peak_memory_bytes": peak_rss_bytes(),
         "gpu_seconds": 0.0,
     });
+    if let (Some(n), Some(sha)) = (w.n_messages, w.message_sha) {
+        events["n_messages"] = json!(n);
+        events["message_trace_sha256"] = json!(sha);
+    }
     std::fs::write(dir.join("events.json"), serde_json::to_string_pretty(&events)? + "\n")?;
     Ok(Some(events))
+}
+
+/// Whether the unit's card asks for message_trace.parquet: `[scoring.params]
+/// requires_message_ledger = false` is the only thing that turns it off, so a missing or
+/// unreadable card keeps the ledger.
+fn ledger_required(config: &Path) -> bool {
+    let card = config.parent().unwrap_or(Path::new(".")).join("card.toml");
+    std::fs::read_to_string(card).map(|t| ledger_in_card(&t)).unwrap_or(true)
+}
+
+fn ledger_in_card(card: &str) -> bool {
+    let mut in_params = false;
+    for line in card.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if l.starts_with('[') {
+            in_params = l == "[scoring.params]";
+        } else if let (true, Some((k, v))) = (in_params, l.split_once('=')) {
+            if k.trim() == "requires_message_ledger" {
+                return v.trim() != "false";
+            }
+        }
+    }
+    true
 }
 
 fn cpu_budget() -> usize {
@@ -140,7 +172,8 @@ fn cmd_simulate(args: &[String]) {
         Ok(p) => p,
         Err(why) => fallback(py, args, &why),
     };
-    match run_one(prepared, Path::new(&out), cpu_budget(), true) {
+    let ledger = ledger_required(Path::new(&config));
+    match run_one(prepared, Path::new(&out), cpu_budget(), true, ledger) {
         Ok(Some(ev)) => println!("{ev}"),
         Ok(None) => fallback(py, args, "trace events out of time order"),
         Err(e) => {
@@ -187,7 +220,8 @@ fn cmd_batch(args: &[String]) {
             sc.spawn(|| loop {
                 let next = queue.lock().unwrap().next();
                 let Some((i, p)) = next else { break };
-                let r = run_one(p, &out_dir.join(&names[i]).join("trace.parquet"), 1, false);
+                // Batch units need a ledger per sub whatever the card says.
+                let r = run_one(p, &out_dir.join(&names[i]).join("trace.parquet"), 1, false, true);
                 *results[i].lock().unwrap() = Some(r);
             });
         }
@@ -258,5 +292,21 @@ fn main() {
             fallback_on_panic("abides_fork.simulate", a.clone());
             cmd_simulate(&a)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ledger_in_card;
+
+    #[test]
+    fn card_ledger_flag() {
+        let off = "[scoring]\nmetric = \"x\"\n\n[scoring.params]\nsemantic_tier = \"A\"\nrequires_message_ledger = false  # throughput unit\n";
+        assert!(!ledger_in_card(off));
+        assert!(ledger_in_card(&off.replace("= false", "= true")));
+        // Only [scoring.params] counts; the same key elsewhere is not the card's setting.
+        assert!(ledger_in_card("[scoring]\nrequires_message_ledger = false\n[scoring.params]\nx = 1\n"));
+        assert!(ledger_in_card("[scoring.params]\nsemantic_tier = \"B\"\n"));
+        assert!(ledger_in_card(""));
     }
 }

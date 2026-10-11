@@ -22,6 +22,7 @@ import subprocess
 import pyarrow.parquet as pq
 
 SCEN_DIR = pathlib.Path.home() / "track3-simulation-public/regression_suite/scenarios"
+UNITS_DIR = pathlib.Path.home() / "track3-simulation-public/units"
 
 
 def _ts(s: str) -> float:
@@ -35,14 +36,16 @@ def _sha(p: pathlib.Path) -> str | None:
     return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
 
 
-def run_one(image: str, scen: pathlib.Path, out_root: pathlib.Path, cpus: str, mem: str) -> dict:
+def run_one(image: str, scen: pathlib.Path, out_root: pathlib.Path, cpus: str, mem: str, card: bool) -> dict:
     out = out_root / scen.stem
     # Containers run as root (as the graders do: ABIDES writes ./log under the workdir), so outputs are
     # root-owned and cannot be cleaned up here; every bench run needs a fresh --out.
     out.mkdir(parents=True, exist_ok=False)
+    # --cards also mounts the unit's card.toml beside the scenario, as the unit directory is mounted.
+    card_mount = ["-v", f"{UNITS_DIR / ('t3-' + scen.stem.replace('_', '-'))}/card.toml:/input/card.toml:ro"] if card else []
     cid = subprocess.run(
         ["docker", "run", "-d", "--network", "none", f"--cpus={cpus}", f"--memory={mem}",
-         "-v", f"{scen}:/input/scenario.json:ro", "-v", f"{out}:/output",
+         "-v", f"{scen}:/input/scenario.json:ro", *card_mount, "-v", f"{out}:/output",
          image, "simulate", "--config", "/input/scenario.json", "--out", "/output/trace.parquet"],
         check=True, capture_output=True, text=True).stdout.strip()
     try:
@@ -71,6 +74,7 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--cpus", default="4")
     ap.add_argument("--memory", default="16g")
+    ap.add_argument("--cards", action="store_true", help="mount each unit's card.toml at /input")
     a = ap.parse_args()
 
     scens = sorted(p for p in SCEN_DIR.glob("*.json") if p.name != "index.json")
@@ -78,7 +82,7 @@ def main() -> int:
         scens = [p for p in scens if any(p.stem.startswith(o) for o in a.only.split(","))]
     a.out.mkdir(parents=True, exist_ok=True)
     with cf.ThreadPoolExecutor(a.workers) as ex:
-        res = sorted(ex.map(lambda s: run_one(a.image, s, a.out, a.cpus, a.memory), scens),
+        res = sorted(ex.map(lambda s: run_one(a.image, s, a.out, a.cpus, a.memory, a.cards), scens),
                      key=lambda r: r["name"])
     (a.out / "bench.json").write_text(json.dumps(res, indent=1))
 

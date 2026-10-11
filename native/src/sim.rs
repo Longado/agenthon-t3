@@ -564,8 +564,9 @@ pub struct Sim {
 pub struct Written {
     pub n_events: u64,
     pub trace_sha: String,
-    pub n_messages: u64,
-    pub message_sha: String,
+    /// None when the run kept no message ledger.
+    pub n_messages: Option<u64>,
+    pub message_sha: Option<String>,
 }
 
 impl Sim {
@@ -747,6 +748,9 @@ impl Sim {
     }
 
     fn push_msg(&mut self, row: MsgRow) {
+        if self.msg_tx.is_none() {
+            return; // no message ledger for this unit
+        }
         self.msgs.push(row);
         if self.msgs.len() == output::PAGE {
             self.flush_msgs();
@@ -767,9 +771,10 @@ impl Sim {
     }
 
     /// Runs the simulation. message_trace rows leave in PAGE-row blocks through `msg_tx` as they
-    /// are delivered, so encoders can work alongside; the sender is dropped on return.
-    pub fn run(&mut self, msg_tx: mpsc::Sender<MsgBlock>) {
-        self.msg_tx = Some(msg_tx);
+    /// are delivered, so encoders can work alongside; the sender is dropped on return. Without a
+    /// sender no message ledger is kept.
+    pub fn run(&mut self, msg_tx: Option<mpsc::Sender<MsgBlock>>) {
+        self.msg_tx = msg_tx;
         self.run_kernel();
         self.flush_msgs();
         self.msg_tx = None;
@@ -1204,10 +1209,12 @@ impl Sim {
     /// abides_fork/trace.py:extract_trace and extract_message_trace. Message pages were encoded
     /// during the run (`msg_pages`); here the message file is assembled on one thread while the
     /// trace rows are ordered and their pages encoded on the rest of the `threads` budget.
-    pub fn write_outputs(&self, msg_pages: MessagePages, trace_path: &Path, msg_path: &Path, threads: usize) -> io::Result<Written> {
-        let n_msgs = msg_pages.rows;
-        let write_msgs = move || {
-            msg_cols(&[], 0, |cols| output::assemble_message_pages(msg_path, n_msgs, cols, msg_pages.by_column()))
+    pub fn write_outputs(&self, msg_pages: Option<MessagePages>, trace_path: &Path, msg_path: &Path, threads: usize) -> io::Result<Written> {
+        let n_msgs = msg_pages.as_ref().map(|m| m.rows as u64);
+        let write_msgs = move || -> io::Result<Option<String>> {
+            let Some(pages) = msg_pages else { return Ok(None) };
+            let n = pages.rows;
+            msg_cols(&[], 0, |cols| output::assemble_message_pages(msg_path, n, cols, pages.by_column())).map(Some)
         };
         let write_trace = |threads: usize| -> io::Result<(usize, String)> {
             let segs = self.trace_rows(threads);
@@ -1238,7 +1245,7 @@ impl Sim {
             let sha = Self::with_trace_cols(&segs, |cols| output::assemble_trace_pages(trace_path, n, cols, by_col))?;
             Ok((n, sha))
         };
-        let (t, m) = if threads >= 2 {
+        let (t, m) = if threads >= 2 && n_msgs.is_some() {
             std::thread::scope(|sc| {
                 let h = sc.spawn(write_msgs);
                 // The message file is serialized by the time the trace rows are ordered, so the
@@ -1247,10 +1254,10 @@ impl Sim {
                 (t, h.join().expect("message writer panicked"))
             })
         } else {
-            (write_trace(1), write_msgs())
+            (write_trace(threads), write_msgs())
         };
         let (n_events, trace_sha) = t?;
-        Ok(Written { n_events: n_events as u64, trace_sha, n_messages: n_msgs as u64, message_sha: m? })
+        Ok(Written { n_events: n_events as u64, trace_sha, n_messages: n_msgs, message_sha: m? })
     }
 
     /// trace.parquet rows in order, as up to `parts` consecutive segments built in parallel:

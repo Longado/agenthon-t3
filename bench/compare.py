@@ -14,6 +14,7 @@ import argparse
 import concurrent.futures as cf
 import os
 import pathlib
+import tomllib
 import subprocess
 import tempfile
 import time
@@ -43,11 +44,21 @@ def first_diff(a: pd.DataFrame, b: pd.DataFrame) -> str:
     return ""
 
 
+UNITS_DIR = pathlib.Path.home() / "track3-simulation-public/units"
+
+
+def ledger_optional(stem: str) -> bool:
+    """True when the unit's card says message_trace.parquet may be omitted."""
+    card = UNITS_DIR / ("t3-" + stem.replace("_", "-")) / "card.toml"
+    return card.exists() and tomllib.loads(card.read_text())["scoring"]["params"].get("requires_message_ledger") is False
+
+
 def diff_dir(out: pathlib.Path, ref: pathlib.Path) -> str:
     msgs = []
     for f in ("trace.parquet", "message_trace.parquet"):
         if not (out / f).exists():
-            msgs.append(f"[{f}] missing")
+            if not (f == "message_trace.parquet" and ledger_optional(ref.name)):
+                msgs.append(f"[{f}] missing")
             continue
         d = first_diff(pd.read_parquet(out / f), pd.read_parquet(ref / f))
         if d:

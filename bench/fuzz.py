@@ -36,12 +36,12 @@ def num(r: random.Random, lo: float, hi: float, as_int: bool, float_rate: float 
     return v
 
 
-def mutate(base: dict, r: random.Random, i: int) -> dict:
+def mutate(base: dict, r: random.Random, i: int, size: float = 1.0) -> dict:
     s = copy.deepcopy(base)
     s["scenario_id"] = f"fuzz-{i:04d}"
     s["seed"] = r.randrange(2**32)
     # Keep the baseline's runtime bounded: big families get a short horizon.
-    scale = r.uniform(0.15, 1.0) * (0.12 if base.get("scenario_family", "").startswith("gb") or base["horizon_ns"] > 2e10 else 1.0)
+    scale = r.uniform(0.15, 1.0) * size * (0.12 if base.get("scenario_family", "").startswith("gb") or base["horizon_ns"] > 2e10 else 1.0)
     s["horizon_ns"] = max(int(base["horizon_ns"] * scale), 50_000_000)
 
     ex = s.setdefault("exchange_config", {})
@@ -148,6 +148,7 @@ def main() -> int:
     ap.add_argument("--out", type=pathlib.Path, required=True)
     ap.add_argument("--jobs", type=int, default=7)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--size", type=float, default=1.0, help="horizon multiplier (larger runs, slower baseline)")
     a = ap.parse_args()
     r = random.Random(a.seed)
     bases = [json.loads(p.read_text()) for p in sorted(SCEN_DIR.glob("*.json")) if p.name != "index.json"]
@@ -157,7 +158,7 @@ def main() -> int:
     for i in range(a.n):
         b = r.choice(bases)
         p = scen_dir / f"fuzz-{i:04d}.json"
-        p.write_text(json.dumps(mutate(b, r, i), indent=1))
+        p.write_text(json.dumps(mutate(b, r, i, a.size), indent=1))
         paths.append(p)
     tally: dict[str, int] = {}
     with cf.ThreadPoolExecutor(a.jobs) as ex:
