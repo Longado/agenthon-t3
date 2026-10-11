@@ -34,8 +34,10 @@ COPY --from=native /src/target/release/t3sim /usr/local/bin/simulate
 # Transparent huge pages for malloc'd memory: hosts default to THP=madvise, where the engine's
 # few hundred MB of event logs otherwise cost ~50 ms of 4 KiB page faults on a large scenario.
 # A high mmap threshold keeps freed buffers in malloc's arenas for reuse instead of returning them
-# to the kernel and faulting fresh zeroed pages in again (measured 2-15% faster per scenario).
-ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.trim_threshold=1073741824
+# to the kernel and faulting fresh zeroed pages in again (measured 2-15% faster per scenario), and
+# one arena for all threads stops every encoder thread from faulting in its own huge pages
+# (another 3-11%).
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.trim_threshold=1073741824:glibc.malloc.arena_max=1
 RUN ln -s simulate /usr/local/bin/simulate-batch
 # Precompile bytecode: PYTHONDONTWRITEBYTECODE stops caching at runtime, so every container start
 # otherwise recompiles the adapter (and anything pip left uncompiled).
