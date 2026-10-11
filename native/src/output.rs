@@ -9,7 +9,8 @@
 //! byte-identical to the reference. Both are constant per file kind
 //! (index=False => no row-count dependent metadata).
 //! Speed: the parquet crate's generic column writers cost ~110 ms per 1M rows, so the
-//! page bytes are encoded here (v1 data pages, snappy, DELTA_BINARY_PACKED ints,
+//! page bytes are encoded here (v1 data pages, uncompressed: snappy saved 2-10% of bytes on
+//! these encodings for real CPU time; DELTA_BINARY_PACKED ints,
 //! dictionary strings, no statistics) and spliced into a `SerializedFileWriter`
 //! with `append_column`, which still writes the footer/schema/metadata.
 //! Columns are read through per-row closures (no materialized column vectors), every
@@ -149,12 +150,6 @@ pub struct Chunk {
     num_values: i64,
 }
 
-/// Per-thread encoder state.
-pub struct Scratch {
-    snap: snap::raw::Encoder,
-    comp: Vec<u8>,
-}
-
 impl Chunk {
     fn new() -> Self {
         Chunk { buf: Vec::new(), uncompressed: 0, first_data: None, dict: false, num_values: 0 }
@@ -171,10 +166,9 @@ impl Chunk {
         self.num_values += next.num_values;
     }
 
-    /// Appends one snappy-compressed page (header + body).
-    fn page(&mut self, sc: &mut Scratch, kind: i32, num_values: usize, enc: i32, body: &[u8]) {
-        sc.comp.resize(snap::raw::max_compress_len(body.len()), 0);
-        let n = sc.snap.compress(body, &mut sc.comp).expect("snappy");
+    /// Appends one uncompressed page (header + body).
+    fn page(&mut self, kind: i32, num_values: usize, enc: i32, body: &[u8]) {
+        let n = body.len();
         let mut h = Vec::with_capacity(32);
         let mut last = 0;
         i32_field(&mut h, &mut last, 1, kind);
@@ -201,7 +195,7 @@ impl Chunk {
         h.push(0);
         self.uncompressed += (h.len() + body.len()) as i64;
         self.buf.extend_from_slice(&h);
-        self.buf.extend_from_slice(&sc.comp[..n]);
+        self.buf.extend_from_slice(body);
     }
 }
 
@@ -256,41 +250,76 @@ const DELTA_MINI: usize = 32;
 
 /// DELTA_BINARY_PACKED; `is32` selects INT32 wrap-around semantics for the deltas.
 fn delta_encode(out: &mut Vec<u8>, v: &[i64], is32: bool) {
+    if is32 {
+        delta_encode_as::<true>(out, v)
+    } else {
+        delta_encode_as::<false>(out, v)
+    }
+}
+
+fn delta_encode_as<const IS32: bool>(out: &mut Vec<u8>, v: &[i64]) {
     uleb(out, DELTA_BLOCK as u64);
     uleb(out, (DELTA_BLOCK / DELTA_MINI) as u64);
     uleb(out, v.len() as u64);
     uleb(out, zigzag(v.first().copied().unwrap_or(0)));
-    let sub = |a: i64, b: i64| -> i64 {
-        if is32 { (a as i32).wrapping_sub(b as i32) as i64 } else { a.wrapping_sub(b) }
-    };
-    let rel = |d: i64, min: i64| -> u64 {
-        if is32 { (d as i32).wrapping_sub(min as i32) as u32 as u64 } else { d.wrapping_sub(min) as u64 }
-    };
     let mut deltas = [0i64; DELTA_BLOCK];
+    let mut rel = [0u64; DELTA_BLOCK];
     let mut i = 1;
     while i < v.len() {
         let k = (v.len() - i).min(DELTA_BLOCK);
         for j in 0..k {
-            deltas[j] = sub(v[i + j], v[i + j - 1]);
+            deltas[j] = if IS32 { (v[i + j] as i32).wrapping_sub(v[i + j - 1] as i32) as i64 } else { v[i + j].wrapping_sub(v[i + j - 1]) };
         }
         let min = *deltas[..k].iter().min().unwrap();
         uleb(out, zigzag(min));
+        for j in 0..DELTA_BLOCK {
+            // A short final miniblock is padded with zeros (= min_delta).
+            rel[j] = if j >= k {
+                0
+            } else if IS32 {
+                (deltas[j] as i32).wrapping_sub(min as i32) as u32 as u64
+            } else {
+                deltas[j].wrapping_sub(min) as u64
+            };
+        }
         let used = k.div_ceil(DELTA_MINI);
         let mut widths = [0u8; DELTA_BLOCK / DELTA_MINI];
         for m in 0..used {
-            let hi = ((m + 1) * DELTA_MINI).min(k);
-            let mx = deltas[m * DELTA_MINI..hi].iter().map(|d| rel(*d, min)).max().unwrap();
-            widths[m] = (64 - mx.leading_zeros()) as u8;
+            // The OR has the same highest set bit as the max.
+            let or = rel[m * DELTA_MINI..(m + 1) * DELTA_MINI].iter().fold(0u64, |a, x| a | x);
+            widths[m] = (64 - or.leading_zeros()) as u8;
         }
         out.extend_from_slice(&widths);
         for m in 0..used {
-            let hi = ((m + 1) * DELTA_MINI).min(k);
-            // short final miniblock is padded with zeros (= min_delta)
-            let it = (m * DELTA_MINI..(m + 1) * DELTA_MINI).map(|j| if j < hi { rel(deltas[j], min) } else { 0 });
-            bitpack(out, it, widths[m] as u32);
+            pack32(out, &rel[m * DELTA_MINI..(m + 1) * DELTA_MINI], widths[m] as u32);
         }
         i += k;
     }
+}
+
+/// Bit-packs 32 values at `width` bits each, LSB first: exactly 4 * width bytes.
+fn pack32(out: &mut Vec<u8>, vals: &[u64], width: u32) {
+    debug_assert_eq!(vals.len(), DELTA_MINI);
+    if width == 0 {
+        return;
+    }
+    let bytes = 4 * width as usize;
+    let start = out.len();
+    out.resize(start + bytes, 0);
+    let dst = &mut out[start..];
+    let (mut acc, mut nb, mut pos) = (0u128, 0u32, 0usize);
+    for &x in vals {
+        acc |= (x as u128) << nb;
+        nb += width;
+        if nb >= 64 {
+            dst[pos..pos + 8].copy_from_slice(&(acc as u64).to_le_bytes());
+            pos += 8;
+            acc >>= 64;
+            nb -= 64;
+        }
+    }
+    let rest = bytes - pos; // 0 or 4: 4 * width bytes is a multiple of 4
+    dst[pos..].copy_from_slice(&(acc as u64).to_le_bytes()[..rest]);
 }
 
 /// Dictionary-encodes strings; ids are assigned by first appearance.
@@ -323,7 +352,7 @@ impl Dict {
     }
 }
 
-fn encode_i64_pages(c: &mut Chunk, sc: &mut Scratch, vals: impl Fn(usize, usize) -> (Vec<i64>, Option<Vec<bool>>), n: usize, is32: bool, nullable: bool) {
+fn encode_i64_pages(c: &mut Chunk, vals: impl Fn(usize, usize) -> (Vec<i64>, Option<Vec<bool>>), n: usize, is32: bool, nullable: bool) {
     let mut body = Vec::new();
     let mut s = 0;
     while s < n {
@@ -332,12 +361,12 @@ fn encode_i64_pages(c: &mut Chunk, sc: &mut Scratch, vals: impl Fn(usize, usize)
         body.clear();
         def_levels(&mut body, e - s, if nullable { present.as_deref() } else { None });
         delta_encode(&mut body, &v, is32);
-        c.page(sc, PAGE_DATA, e - s, ENC_DELTA, &body);
+        c.page(PAGE_DATA, e - s, ENC_DELTA, &body);
         s = e;
     }
 }
 
-fn encode_str_chunk(c: &mut Chunk, sc: &mut Scratch, v: &[Option<&'static str>], all_present: bool) {
+fn encode_str_chunk(c: &mut Chunk, v: &[Option<&'static str>], all_present: bool) {
     let mut d = Dict::new();
     let ids: Vec<Option<u32>> = v.iter().map(|x| x.map(|s| d.id(s))).collect();
     let mut body = Vec::new();
@@ -345,7 +374,7 @@ fn encode_str_chunk(c: &mut Chunk, sc: &mut Scratch, v: &[Option<&'static str>],
         body.extend_from_slice(&(s.len() as u32).to_le_bytes());
         body.extend_from_slice(s.as_bytes());
     }
-    c.page(sc, PAGE_DICT, d.entries.len(), ENC_PLAIN, &body);
+    c.page(PAGE_DICT, d.entries.len(), ENC_PLAIN, &body);
     let width = (32 - (d.entries.len().max(2) as u32 - 1).leading_zeros()).max(1);
     let n = v.len();
     let mut s = 0;
@@ -358,20 +387,19 @@ fn encode_str_chunk(c: &mut Chunk, sc: &mut Scratch, v: &[Option<&'static str>],
         let k = ids[s..e].iter().flatten().count();
         uleb(&mut body, ((k.div_ceil(8)) as u64) << 1 | 1);
         bitpack(&mut body, ids[s..e].iter().flatten().map(|x| *x as u64), width);
-        c.page(sc, PAGE_DATA, e - s, ENC_RLE_DICT, &body);
+        c.page(PAGE_DATA, e - s, ENC_RLE_DICT, &body);
         s = e;
     }
 }
 
-fn encode_col(col: &Col, start: usize, end: usize, sc: &mut Scratch) -> Chunk {
+fn encode_col(col: &Col, start: usize, end: usize) -> Chunk {
     let mut c = Chunk::new();
     let n = end - start;
     match col {
-        Col::I64(f) => encode_i64_pages(&mut c, sc, |s, e| ((start + s..start + e).map(|i| f(i)).collect(), None), n, false, false),
-        Col::I32(f) => encode_i64_pages(&mut c, sc, |s, e| ((start + s..start + e).map(|i| f(i) as i64).collect(), None), n, true, false),
+        Col::I64(f) => encode_i64_pages(&mut c, |s, e| ((start + s..start + e).map(|i| f(i)).collect(), None), n, false, false),
+        Col::I32(f) => encode_i64_pages(&mut c, |s, e| ((start + s..start + e).map(|i| f(i) as i64).collect(), None), n, true, false),
         Col::OptI64(f) => encode_i64_pages(
             &mut c,
-            sc,
             |s, e| {
                 let sl: Vec<Option<i64>> = (start + s..start + e).map(|i| f(i)).collect();
                 (sl.iter().flatten().copied().collect(), Some(sl.iter().map(|x| x.is_some()).collect()))
@@ -382,18 +410,18 @@ fn encode_col(col: &Col, start: usize, end: usize, sc: &mut Scratch) -> Chunk {
         ),
         Col::Str(f) => {
             let o: Vec<Option<&'static str>> = (start..end).map(|i| Some(f(i))).collect();
-            encode_str_chunk(&mut c, sc, &o, true);
+            encode_str_chunk(&mut c, &o, true);
         }
         Col::OptStr(f) => {
             let o: Vec<Option<&'static str>> = (start..end).map(|i| f(i)).collect();
-            encode_str_chunk(&mut c, sc, &o, false);
+            encode_str_chunk(&mut c, &o, false);
         }
         Col::Dict(t, _) => {
-            c = dict_chunk(t, sc);
+            c = dict_chunk(t);
             let mut s = start;
             while s < end {
                 let e = (s + PAGE_ROWS).min(end);
-                c.append(&encode_page(col, s, e, sc));
+                c.append(&encode_page(col, s, e));
                 s = e;
             }
         }
@@ -405,31 +433,31 @@ fn encode_col(col: &Col, start: usize, end: usize, sc: &mut Scratch) -> Chunk {
 pub const PAGE: usize = PAGE_ROWS;
 
 /// The dictionary page of a fixed-table column (PLAIN entries).
-fn dict_chunk(table: &[&'static str], sc: &mut Scratch) -> Chunk {
+fn dict_chunk(table: &[&'static str]) -> Chunk {
     let mut c = Chunk::new();
     let mut body = Vec::new();
     for s in table {
         body.extend_from_slice(&(s.len() as u32).to_le_bytes());
         body.extend_from_slice(s.as_bytes());
     }
-    c.page(sc, PAGE_DICT, table.len(), ENC_PLAIN, &body);
+    c.page(PAGE_DICT, table.len(), ENC_PLAIN, &body);
     c
 }
 
 /// One data page of rows `start..end` (at most PAGE rows) as a chunk fragment.
 /// Supports the page-independent column kinds (ints and fixed-table strings).
-pub fn encode_page(col: &Col, start: usize, end: usize, sc: &mut Scratch) -> Chunk {
+pub fn encode_page(col: &Col, start: usize, end: usize) -> Chunk {
     debug_assert!(end - start <= PAGE_ROWS);
     let mut c = Chunk::new();
     let n = end - start;
     match col {
         Col::I64(_) | Col::I32(_) | Col::OptI64(_) => {
             // A single page: encode_col's page loop runs once.
-            return encode_col(col, start, end, sc);
+            return encode_col(col, start, end);
         }
         Col::Dict(t, f) => {
             let ids: Vec<u32> = (start..end).map(|i| f(i)).collect();
-            dict_data_page(&mut c, sc, t.len(), n, &ids);
+            dict_data_page(&mut c, t.len(), n, &ids);
         }
         Col::Str(_) | Col::OptStr(_) => panic!("first-appearance dictionaries are chunk-level only"),
     }
@@ -437,14 +465,14 @@ pub fn encode_page(col: &Col, start: usize, end: usize, sc: &mut Scratch) -> Chu
 }
 
 /// RLE_DICTIONARY data page (all rows present) over a dictionary of `dict_len` entries.
-fn dict_data_page(c: &mut Chunk, sc: &mut Scratch, dict_len: usize, rows: usize, ids: &[u32]) {
+fn dict_data_page(c: &mut Chunk, dict_len: usize, rows: usize, ids: &[u32]) {
     let width = (32 - (dict_len.max(2) as u32 - 1).leading_zeros()).max(1);
     let mut body = Vec::with_capacity(16 + ids.len());
     def_levels(&mut body, rows, None);
     body.push(width as u8);
     uleb(&mut body, ((ids.len().div_ceil(8)) as u64) << 1 | 1);
     bitpack(&mut body, ids.iter().map(|x| *x as u64), width);
-    c.page(sc, PAGE_DATA, rows, ENC_RLE_DICT, &body);
+    c.page(PAGE_DATA, rows, ENC_RLE_DICT, &body);
 }
 
 /// Assembles a file from per-column page fragments (`pages[col][page]`, PAGE rows each but the
@@ -457,14 +485,13 @@ fn assemble_pages(
     n: usize,
     cols: &[Col],
     pages: Vec<Vec<Chunk>>,
-    sc: &mut Scratch,
 ) -> io::Result<String> {
     let per_rg = ROW_GROUP / PAGE_ROWS;
     let mut chunks = Vec::with_capacity(n.div_ceil(ROW_GROUP) * cols.len());
     for rg in 0..n.div_ceil(ROW_GROUP) {
         for (c, col) in cols.iter().enumerate() {
             let mut chunk = match col {
-                Col::Dict(t, _) => dict_chunk(t, sc),
+                Col::Dict(t, _) => dict_chunk(t),
                 _ => Chunk::new(),
             };
             let hi = ((rg + 1) * per_rg).min(pages[c].len());
@@ -477,16 +504,12 @@ fn assemble_pages(
     assemble(path, schema, pandas_json, arrow_schema_b64, n, chunks)
 }
 
-pub fn assemble_trace_pages(path: &Path, n: usize, cols: &[Col; 7], pages: Vec<Vec<Chunk>>, sc: &mut Scratch) -> io::Result<String> {
-    assemble_pages(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, n, cols, pages, sc)
+pub fn assemble_trace_pages(path: &Path, n: usize, cols: &[Col; 7], pages: Vec<Vec<Chunk>>) -> io::Result<String> {
+    assemble_pages(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, n, cols, pages)
 }
 
-pub fn assemble_message_pages(path: &Path, n: usize, cols: &[Col; 10], pages: Vec<Vec<Chunk>>, sc: &mut Scratch) -> io::Result<String> {
-    assemble_pages(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, n, cols, pages, sc)
-}
-
-pub fn new_scratch() -> Scratch {
-    Scratch { snap: snap::raw::Encoder::new(), comp: Vec::new() }
+pub fn assemble_message_pages(path: &Path, n: usize, cols: &[Col; 10], pages: Vec<Vec<Chunk>>) -> io::Result<String> {
+    assemble_pages(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, n, cols, pages)
 }
 
 /// Number of independent encode jobs for `n` rows of `ncols` columns: one per (row group, column).
@@ -495,31 +518,29 @@ pub fn n_jobs(n: usize, ncols: usize) -> usize {
 }
 
 /// Encodes job `j` (row group `j / cols.len()`, column `j % cols.len()`).
-pub fn encode_job(cols: &[Col], n: usize, j: usize, sc: &mut Scratch) -> Chunk {
+pub fn encode_job(cols: &[Col], n: usize, j: usize) -> Chunk {
     let (rg, c) = (j / cols.len(), j % cols.len());
-    encode_col(&cols[c], rg * ROW_GROUP, ((rg + 1) * ROW_GROUP).min(n), sc)
+    encode_col(&cols[c], rg * ROW_GROUP, ((rg + 1) * ROW_GROUP).min(n))
 }
 
 /// Encodes every (row group, column) chunk, on `threads` scoped workers when `threads > 1`.
 fn encode_all(cols: &[Col], n: usize, threads: usize) -> Vec<Chunk> {
     let jobs = n_jobs(n, cols.len());
-    let job = |j: usize, sc: &mut Scratch| encode_job(cols, n, j, sc);
+    let job = |j: usize| encode_job(cols, n, j);
     if threads <= 1 || jobs <= 1 {
-        let mut sc = new_scratch();
-        return (0..jobs).map(|j| job(j, &mut sc)).collect();
+        return (0..jobs).map(|j| job(j)).collect();
     }
     let next = AtomicUsize::new(0);
     let out: Vec<Mutex<Option<Chunk>>> = (0..jobs).map(|_| Mutex::new(None)).collect();
     std::thread::scope(|s| {
         for _ in 0..threads.min(jobs) {
             s.spawn(|| {
-                let mut sc = new_scratch();
-                loop {
+                        loop {
                     let j = next.fetch_add(1, Ordering::Relaxed);
                     if j >= jobs {
                         break;
                     }
-                    *out[j].lock().unwrap() = Some(job(j, &mut sc));
+                    *out[j].lock().unwrap() = Some(job(j));
                 }
             });
         }
@@ -553,7 +574,7 @@ fn assemble(
     let schema = Arc::new(parse_message_type(schema).map_err(err)?);
     let props = Arc::new(
         WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
+            .set_compression(Compression::UNCOMPRESSED)
             .set_key_value_metadata(Some(vec![
                 KeyValue::new("ARROW:schema".to_string(), arrow_schema_b64.to_string()),
                 KeyValue::new("pandas".to_string(), pandas_json.to_string()),
@@ -576,7 +597,7 @@ fn assemble(
                 vec![Encoding::RLE, Encoding::DELTA_BINARY_PACKED]
             };
             let meta = ColumnChunkMetaData::builder(d.clone())
-                .set_compression(Compression::SNAPPY)
+                .set_compression(Compression::UNCOMPRESSED)
                 .set_encodings(enc)
                 .set_num_values(c.num_values)
                 .set_total_compressed_size(c.buf.len() as i64)

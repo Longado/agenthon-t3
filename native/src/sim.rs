@@ -1161,8 +1161,7 @@ impl Sim {
     pub fn write_outputs(&self, msg_pages: MessagePages, trace_path: &Path, msg_path: &Path, threads: usize) -> io::Result<Written> {
         let n_msgs = msg_pages.rows;
         let write_msgs = move || {
-            let mut sc = output::new_scratch();
-            msg_cols(&[], 0, |cols| output::assemble_message_pages(msg_path, n_msgs, cols, msg_pages.by_column(), &mut sc))
+            msg_cols(&[], 0, |cols| output::assemble_message_pages(msg_path, n_msgs, cols, msg_pages.by_column()))
         };
         let write_trace = |helpers: usize| -> io::Result<(usize, String)> {
             let prep = self.trace_prep();
@@ -1172,14 +1171,13 @@ impl Sim {
             let out: Vec<Mutex<Option<Chunk>>> = (0..jobs).map(|_| Mutex::new(None)).collect();
             let next = AtomicUsize::new(0);
             let work = || {
-                let mut sc = output::new_scratch();
                 self.with_trace_cols(&prep, |cols| loop {
                     let j = next.fetch_add(1, Relaxed);
                     if j >= jobs {
                         break;
                     }
                     let (c, pg) = (j / pages, j % pages);
-                    let page = output::encode_page(&cols[c], pg * output::PAGE, ((pg + 1) * output::PAGE).min(n), &mut sc);
+                    let page = output::encode_page(&cols[c], pg * output::PAGE, ((pg + 1) * output::PAGE).min(n));
                     *out[j].lock().unwrap() = Some(page);
                 })
             };
@@ -1191,8 +1189,7 @@ impl Sim {
             });
             let mut it = out.into_iter().map(|m| m.into_inner().unwrap().expect("encoded page"));
             let by_col: Vec<Vec<Chunk>> = (0..7).map(|_| it.by_ref().take(pages).collect()).collect();
-            let mut sc = output::new_scratch();
-            let sha = self.with_trace_cols(&prep, |cols| output::assemble_trace_pages(trace_path, n, cols, by_col, &mut sc))?;
+            let sha = self.with_trace_cols(&prep, |cols| output::assemble_trace_pages(trace_path, n, cols, by_col))?;
             Ok((n, sha))
         };
         let (t, m) = if threads >= 2 {
@@ -1349,12 +1346,11 @@ impl MessagePages {
     /// Encodes blocks from `rx` until every sender is gone. Any number of threads may call this
     /// on the same receiver concurrently; `finish` then yields the pages.
     pub fn work(rx: &Mutex<mpsc::Receiver<MsgBlock>>, into: &Mutex<Vec<Option<Vec<Chunk>>>>, rows: &AtomicUsize) {
-        let mut sc = output::new_scratch();
         loop {
             let next = rx.lock().unwrap().recv();
             let Ok(MsgBlock(b, block)) = next else { break };
             let pages = msg_cols(&block, b * output::PAGE, |cols| {
-                cols.iter().map(|c| output::encode_page(c, 0, block.len(), &mut sc)).collect::<Vec<_>>()
+                cols.iter().map(|c| output::encode_page(c, 0, block.len())).collect::<Vec<_>>()
             });
             rows.fetch_add(block.len(), Relaxed);
             let mut v = into.lock().unwrap();
