@@ -11,7 +11,6 @@ mod sim;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
@@ -64,32 +63,26 @@ fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool, ledger: b
     let scenario_id = p.cfg.scenario_id.clone();
     let mut s = sim::Sim::new(p.cfg);
     let mut t_sim = Default::default();
-    let msg_pages = if ledger {
-        // message_trace pages are encoded by `threads - 1` helpers while the simulation runs; the
-        // main thread drains whatever is left once it finishes.
-        let (tx, rx) = mpsc::channel();
-        let (rx, pages, rows) = (Mutex::new(rx), Mutex::new(Vec::new()), AtomicUsize::new(0));
-        std::thread::scope(|sc| {
-            for _ in 1..threads {
-                sc.spawn(|| sim::MessagePages::work(&rx, &pages, &rows));
-            }
-            s.run(Some(tx));
-            t_sim = t0.elapsed();
-            sim::MessagePages::work(&rx, &pages, &rows);
-        });
-        Some(sim::MessagePages::finish(pages, rows))
-    } else {
-        s.run(None);
+    // Trace segments and message_trace pages are encoded by `threads - 1` helpers while the
+    // simulation runs; the main thread drains whatever is left once it finishes.
+    let (tx, rx) = mpsc::channel();
+    let (rx, enc) = (Mutex::new(rx), Mutex::new(sim::Encoded::default()));
+    std::thread::scope(|sc| {
+        for _ in 1..threads {
+            sc.spawn(|| sim::work(&rx, &enc));
+        }
+        s.run(tx, ledger);
         t_sim = t0.elapsed();
-        None
-    };
+        sim::work(&rx, &enc);
+    });
     if s.disordered() {
         return Ok(None);
     }
+    let enc = enc.into_inner().unwrap();
     let t_run = t0.elapsed();
     let dir = trace_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
-    let w = s.write_outputs(msg_pages, trace_path, &dir.join("message_trace.parquet"), threads)?;
+    let w = s.write_outputs(enc, trace_path, &dir.join("message_trace.parquet"))?;
     if std::env::var_os("T3SIM_TIMING").is_some() {
         eprintln!("t3sim timing: sim {:?} run {:?} write {:?} (threads {threads})", t_sim, t_run, t0.elapsed() - t_run);
     }

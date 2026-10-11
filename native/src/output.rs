@@ -483,41 +483,56 @@ fn dict_data_page(c: &mut Chunk, dict_len: usize, rows: usize, ids: &[u32]) {
     c.page(PAGE_DATA, rows, ENC_RLE_DICT, &body);
 }
 
-/// Assembles a file from per-column page fragments (`pages[col][page]`, PAGE rows each but the
-/// last); `cols` supplies each column's kind (for dictionary pages). Returns the SHA-256.
+/// Assembles a file from per-column page fragments: `pages[col][page]`, where page `p` holds
+/// `page_rows[p]` rows in every column. Consecutive pages form row groups of at most ROW_GROUP
+/// rows (at least one page each); `dicts[col]` is the fixed table of a dictionary column.
+/// Returns the SHA-256.
 fn assemble_pages(
     path: &Path,
     schema: &str,
     pandas_json: &str,
     arrow_schema_b64: &str,
-    n: usize,
-    cols: &[Col],
+    dicts: &[Option<&'static [&'static str]>],
     pages: Vec<Vec<Chunk>>,
+    page_rows: &[usize],
 ) -> io::Result<String> {
-    let per_rg = ROW_GROUP / PAGE_ROWS;
-    let mut chunks = Vec::with_capacity(n.div_ceil(ROW_GROUP) * cols.len());
-    for rg in 0..n.div_ceil(ROW_GROUP) {
-        for (c, col) in cols.iter().enumerate() {
-            let mut chunk = match col {
-                Col::Dict(t, _) => dict_chunk(t),
-                _ => Chunk::new(),
+    let mut groups: Vec<(usize, usize)> = Vec::new(); // (rows, pages)
+    let (mut rows, mut np) = (0, 0);
+    for &r in page_rows {
+        if np > 0 && rows + r > ROW_GROUP {
+            groups.push((rows, np));
+            (rows, np) = (0, 0);
+        }
+        rows += r;
+        np += 1;
+    }
+    if np > 0 {
+        groups.push((rows, np));
+    }
+    let mut cols: Vec<_> = pages.into_iter().map(Vec::into_iter).collect();
+    let mut chunks = Vec::with_capacity(groups.len() * dicts.len());
+    for &(_, np) in &groups {
+        for (c, d) in dicts.iter().enumerate() {
+            let mut chunk = match d {
+                Some(t) => dict_chunk(t),
+                None => Chunk::new(),
             };
-            let hi = ((rg + 1) * per_rg).min(pages[c].len());
-            for pg in &pages[c][rg * per_rg..hi] {
-                chunk.append(pg);
+            for pg in cols[c].by_ref().take(np) {
+                chunk.append(&pg);
             }
             chunks.push(chunk);
         }
     }
-    assemble(path, schema, pandas_json, arrow_schema_b64, n, chunks)
+    let rg_rows: Vec<usize> = groups.iter().map(|g| g.0).collect();
+    assemble(path, schema, pandas_json, arrow_schema_b64, &rg_rows, chunks)
 }
 
-pub fn assemble_trace_pages(path: &Path, n: usize, cols: &[Col; 7], pages: Vec<Vec<Chunk>>) -> io::Result<String> {
-    assemble_pages(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, n, cols, pages)
+pub fn assemble_trace_pages(path: &Path, dicts: &[Option<&'static [&'static str]>; 7], pages: Vec<Vec<Chunk>>, page_rows: &[usize]) -> io::Result<String> {
+    assemble_pages(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, dicts, pages, page_rows)
 }
 
-pub fn assemble_message_pages(path: &Path, n: usize, cols: &[Col; 10], pages: Vec<Vec<Chunk>>) -> io::Result<String> {
-    assemble_pages(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, n, cols, pages)
+pub fn assemble_message_pages(path: &Path, dicts: &[Option<&'static [&'static str]>; 10], pages: Vec<Vec<Chunk>>, page_rows: &[usize]) -> io::Result<String> {
+    assemble_pages(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, dicts, pages, page_rows)
 }
 
 /// Number of independent encode jobs for `n` rows of `ncols` columns: one per (row group, column).
@@ -567,16 +582,18 @@ fn write_file(
     threads: usize,
 ) -> io::Result<String> {
     let chunks = encode_all(cols, n, threads);
-    assemble(path, schema, pandas_json, arrow_schema_b64, n, chunks)
+    let rg_rows: Vec<usize> = (0..n).step_by(ROW_GROUP).map(|s| (n - s).min(ROW_GROUP)).collect();
+    assemble(path, schema, pandas_json, arrow_schema_b64, &rg_rows, chunks)
 }
 
-/// Serializes already-encoded chunks (job order) into a parquet file at `path`; returns its SHA-256.
+/// Serializes already-encoded chunks (row group by row group, columns in schema order) into a
+/// parquet file at `path`, row group `g` holding `rg_rows[g]` rows; returns its SHA-256.
 fn assemble(
     path: &Path,
     schema: &str,
     pandas_json: &str,
     arrow_schema_b64: &str,
-    n: usize,
+    rg_rows: &[usize],
     chunks: Vec<Chunk>,
 ) -> io::Result<String> {
     let schema = Arc::new(parse_message_type(schema).map_err(err)?);
@@ -593,9 +610,7 @@ fn assemble(
     let mut file: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut w = SerializedFileWriter::new(&mut file, schema, props).map_err(err)?;
     let descrs: Vec<_> = (0..w.schema_descr().num_columns()).map(|i| w.schema_descr().column(i)).collect();
-    let mut start = 0;
-    while start < n {
-        let end = (start + ROW_GROUP).min(n);
+    for &rows in rg_rows {
         let mut rg = w.next_row_group().map_err(err)?;
         for d in &descrs {
             let c = chunks.next().expect("chunk per column");
@@ -616,7 +631,7 @@ fn assemble(
                 .map_err(err)?;
             let close = ColumnCloseResult {
                 bytes_written: c.buf.len() as u64,
-                rows_written: (end - start) as u64,
+                rows_written: rows as u64,
                 metadata: meta,
                 bloom_filter: None,
                 column_index: None,
@@ -625,7 +640,6 @@ fn assemble(
             rg.append_column(&Bytes::from(c.buf), close).map_err(err)?;
         }
         rg.close().map_err(err)?;
-        start = end;
     }
     w.close().map_err(err)?;
     // Hash and write the same bytes concurrently: both are single-threaded passes over the file.
