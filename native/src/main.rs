@@ -227,6 +227,15 @@ fn cmd_batch(args: &[String]) {
     println!("{agg}");
 }
 
+/// Panics hand the invocation to Python instead of aborting: a native bug on an unforeseen
+/// scenario then costs speed, not the unit. (exec from any thread replaces the whole process.)
+fn fallback_on_panic(module: &'static str, args: Vec<String>) {
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("t3sim: {info}");
+        fallback(module, &args, "native engine panicked");
+    }));
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let prog = Path::new(&argv[0]).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -240,11 +249,13 @@ fn main() {
         "simulate-batch" => {
             let mut a = vec!["simulate-batch".to_string()];
             a.extend(args);
+            fallback_on_panic("abides_fork.simulate_batch", a.clone());
             cmd_batch(&a)
         }
         _ => {
             let mut a = vec!["simulate".to_string()];
             a.extend(args);
+            fallback_on_panic("abides_fork.simulate", a.clone());
             cmd_simulate(&a)
         }
     }
