@@ -13,6 +13,7 @@ serde_json = "1"
 sha2 = "0.10"
 parquet = { version = "60", default-features = false, features = ["snap"] }
 bytes = "1"
+snap = "1"
 
 [profile.release]
 opt-level = 3

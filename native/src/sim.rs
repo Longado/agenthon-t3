@@ -5,8 +5,10 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::io;
+use std::path::Path;
 
-use crate::output::{MsgCols, TraceCols};
+use crate::output::{self, Col};
 use crate::rng::RandomState;
 use crate::scenario::{AgentKind, Config, LatencyKind};
 
@@ -133,21 +135,22 @@ enum Msg {
 }
 
 impl Msg {
-    fn type_name(&self) -> &'static str {
+    /// Index into MSG_TYPES (the Python class name written to message_trace).
+    fn type_idx(&self) -> u8 {
         match self {
-            Msg::Wakeup => "WakeupMsg",
-            Msg::MarketHoursRequest => "MarketHoursRequestMsg",
-            Msg::MarketHours => "MarketHoursMsg",
-            Msg::MarketClosePriceRequest => "MarketClosePriceRequestMsg",
-            Msg::MarketClosePrice => "MarketClosePriceMsg",
-            Msg::MarketClosed => "MarketClosedMsg",
-            Msg::QuerySpread => "QuerySpreadMsg",
-            Msg::QuerySpreadResponse { .. } => "QuerySpreadResponseMsg",
-            Msg::LimitOrder(_) => "LimitOrderMsg",
-            Msg::CancelOrder(_) => "CancelOrderMsg",
-            Msg::OrderAccepted(_) => "OrderAcceptedMsg",
-            Msg::OrderExecuted(_) => "OrderExecutedMsg",
-            Msg::OrderCancelled(_) => "OrderCancelledMsg",
+            Msg::Wakeup => 0,
+            Msg::MarketHoursRequest => 1,
+            Msg::MarketHours => 2,
+            Msg::MarketClosePriceRequest => 3,
+            Msg::MarketClosePrice => 4,
+            Msg::MarketClosed => 5,
+            Msg::QuerySpread => 6,
+            Msg::QuerySpreadResponse { .. } => 7,
+            Msg::LimitOrder(_) => 8,
+            Msg::CancelOrder(_) => 9,
+            Msg::OrderAccepted(_) => 10,
+            Msg::OrderExecuted(_) => 11,
+            Msg::OrderCancelled(_) => 12,
         }
     }
     fn order_id(&self) -> Option<i64> {
@@ -163,7 +166,7 @@ impl Msg {
 }
 
 /// Heap entry: Python orders `(deliver_at, (sender_id, recipient_id, message))`, and messages
-/// compare by message_id. `slot` points at the payload; `ledger` at the send-time ledger row.
+/// compare by message_id. `slot` points at the payload and its send-time ledger fields.
 #[derive(PartialEq, Eq)]
 struct Entry {
     time: i64,
@@ -171,7 +174,6 @@ struct Entry {
     recipient: u32,
     msg_id: i64,
     slot: u32,
-    ledger: u32,
 }
 
 impl Ord for Entry {
@@ -191,17 +193,52 @@ impl PartialOrd for Entry {
     }
 }
 
-const NO_LEDGER: u32 = u32::MAX;
+const MSG_TYPES: [&str; 14] = [
+    "WakeupMsg",
+    "MarketHoursRequestMsg",
+    "MarketHoursMsg",
+    "MarketClosePriceRequestMsg",
+    "MarketClosePriceMsg",
+    "MarketClosedMsg",
+    "QuerySpreadMsg",
+    "QuerySpreadResponseMsg",
+    "LimitOrderMsg",
+    "CancelOrderMsg",
+    "OrderAcceptedMsg",
+    "OrderExecutedMsg",
+    "OrderCancelledMsg",
+    "AGENT_WAKEUP",
+];
+const WAKE_ROW: u8 = 13;
+/// Absent order_id / causal_parent / t_send (ids and times are never i64::MIN).
+const NONE: i64 = i64::MIN;
 
-struct LedgerRow {
-    message_id: i64,
-    src: u32,
-    dst: u32,
+/// Send-time ledger fields of an in-flight message, kept beside its payload slot.
+#[derive(Clone, Copy)]
+struct SendRow {
     t_send: i64,
     t_recv: i64,
-    msg_type: &'static str,
-    order_id: Option<i64>,
-    causal: Option<i64>,
+    order_id: i64,
+    causal: i64,
+    msg_type: u8,
+}
+
+const WAKE_SEND: SendRow = SendRow { t_send: NONE, t_recv: NONE, order_id: NONE, causal: NONE, msg_type: 0 };
+
+/// One message_trace row, appended at delivery (so the log is already in `seq` order).
+struct MsgRow {
+    message_id: i64,
+    t_send: i64,
+    t_recv: i64,
+    order_id: i64,
+    causal: i64,
+    src: u32,
+    dst: u32,
+    msg_type: u8,
+}
+
+fn opt(v: i64) -> Option<i64> {
+    if v == NONE { None } else { Some(v) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -442,12 +479,12 @@ pub struct Sim {
     comp_delay: Vec<i64>,
     heap: BinaryHeap<Entry>,
     slots: Vec<Msg>,
+    slot_rows: Vec<SendRow>,
     free_slots: Vec<u32>,
     next_msg_id: i64,
     next_order_id: i64,
     causal: Option<i64>,
-    ledger: Vec<LedgerRow>,
-    delivered: Vec<u32>,
+    msgs: Vec<MsgRow>,
     // exchange (agent 0)
     ex_time: i64,
     book: Book,
@@ -459,9 +496,11 @@ pub struct Sim {
     quote_events: Vec<QuoteEvent>,
 }
 
-pub struct Outputs {
-    pub trace: TraceCols,
-    pub msgs: MsgCols,
+pub struct Written {
+    pub n_events: u64,
+    pub trace_sha: String,
+    pub n_messages: u64,
+    pub message_sha: String,
 }
 
 impl Sim {
@@ -528,12 +567,12 @@ impl Sim {
             comp_delay: vec![50; n_agents],
             heap: BinaryHeap::new(),
             slots: Vec::new(),
+            slot_rows: Vec::new(),
             free_slots: Vec::new(),
             next_msg_id: 1,
             next_order_id: 0,
             causal: None,
-            ledger: Vec::new(),
-            delivered: Vec::new(),
+            msgs: Vec::new(),
             ex_time: 0,
             book,
             close_price_subs: Vec::new(),
@@ -555,14 +594,16 @@ impl Sim {
         id
     }
 
-    fn store(&mut self, m: Msg) -> u32 {
+    fn store(&mut self, m: Msg, row: SendRow) -> u32 {
         match self.free_slots.pop() {
             Some(s) => {
                 self.slots[s as usize] = m;
+                self.slot_rows[s as usize] = row;
                 s
             }
             None => {
                 self.slots.push(m);
+                self.slot_rows.push(row);
                 (self.slots.len() - 1) as u32
             }
         }
@@ -573,19 +614,15 @@ impl Sim {
         let sent_time = self.current_time + self.comp_delay[sender as usize] + delay;
         let latency = self.latency.get(sender, recipient);
         let deliver_at = sent_time + latency;
-        let ledger = self.ledger.len() as u32;
-        self.ledger.push(LedgerRow {
-            message_id: msg_id,
-            src: sender,
-            dst: recipient,
+        let row = SendRow {
             t_send: sent_time,
             t_recv: deliver_at,
-            msg_type: msg.type_name(),
-            order_id: msg.order_id(),
-            causal: self.causal,
-        });
-        let slot = self.store(msg);
-        self.heap.push(Entry { time: deliver_at, sender, recipient, msg_id, slot, ledger });
+            order_id: msg.order_id().unwrap_or(NONE),
+            causal: self.causal.unwrap_or(NONE),
+            msg_type: msg.type_idx(),
+        };
+        let slot = self.store(msg, row);
+        self.heap.push(Entry { time: deliver_at, sender, recipient, msg_id, slot });
     }
 
     fn send(&mut self, sender: u32, recipient: u32, msg: Msg) {
@@ -606,8 +643,8 @@ impl Sim {
     fn set_wakeup(&mut self, agent: u32, t: i64) {
         assert!(!(self.current_time != 0 && t < self.current_time), "wakeup in the past");
         let id = self.new_msg_id();
-        let slot = self.store(Msg::Wakeup);
-        self.heap.push(Entry { time: t, sender: agent, recipient: agent, msg_id: id, slot, ledger: NO_LEDGER });
+        let slot = self.store(Msg::Wakeup, WAKE_SEND);
+        self.heap.push(Entry { time: t, sender: agent, recipient: agent, msg_id: id, slot });
     }
 
     pub fn run(&mut self) {
@@ -634,24 +671,32 @@ impl Sim {
             self.free_slots.push(e.slot);
             if let Msg::Wakeup = msg {
                 self.causal = Some(e.msg_id);
-                let idx = self.ledger.len() as u32;
-                self.ledger.push(LedgerRow {
+                self.msgs.push(MsgRow {
                     message_id: e.msg_id,
+                    t_send: NONE,
+                    t_recv: e.time,
+                    order_id: NONE,
+                    causal: NONE,
                     src: e.recipient,
                     dst: e.recipient,
-                    t_send: i64::MIN,
-                    t_recv: e.time,
-                    msg_type: "AGENT_WAKEUP",
-                    order_id: None,
-                    causal: None,
+                    msg_type: WAKE_ROW,
                 });
-                self.delivered.push(idx);
                 self.wakeup(e.recipient, e.time);
                 self.agent_times[r] += self.comp_delay[r];
             } else {
                 self.agent_times[r] += self.comp_delay[r];
                 self.causal = Some(e.msg_id);
-                self.delivered.push(e.ledger);
+                let w = self.slot_rows[e.slot as usize];
+                self.msgs.push(MsgRow {
+                    message_id: e.msg_id,
+                    t_send: w.t_send,
+                    t_recv: w.t_recv,
+                    order_id: w.order_id,
+                    causal: w.causal,
+                    src: e.sender,
+                    dst: e.recipient,
+                    msg_type: w.msg_type,
+                });
                 self.receive(e.recipient, e.time, e.sender, msg);
             }
         }
@@ -743,7 +788,7 @@ impl Sim {
                 tr.known_ask = ask.map(|a| a.0);
                 spread_response = true;
             }
-            other => panic!("trader received unexpected {}", other.type_name()),
+            other => panic!("trader received unexpected {}", MSG_TYPES[other.type_idx() as usize]),
         }
         let have_hours = self.traders[i].mkt_open.is_some() && self.traders[i].mkt_close.is_some();
         if have_hours && !had_hours {
@@ -881,7 +926,7 @@ impl Sim {
             Msg::CancelOrder(o) => {
                 self.cancel_order(&o);
             }
-            other => panic!("exchange received unexpected {}", other.type_name()),
+            other => panic!("exchange received unexpected {}", MSG_TYPES[other.type_idx() as usize]),
         }
     }
 
@@ -1024,21 +1069,49 @@ impl Sim {
 
     // --- outputs -----------------------------------------------------------------------------
 
-    /// abides_fork/trace.py:extract_trace and extract_message_trace.
-    pub fn outputs(self) -> Outputs {
-        // Final fill per order id = its last ORDER_EXECUTED event.
-        let mut last_exec: HashMap<i64, usize> = HashMap::new();
-        for (k, e) in self.order_events.iter().enumerate() {
+    /// abides_fork/trace.py:extract_trace and extract_message_trace, written straight from the
+    /// event logs. `threads` is the CPU budget: >= 2 writes the two files concurrently.
+    pub fn write_outputs(&self, trace_path: &Path, msg_path: &Path, threads: usize) -> io::Result<Written> {
+        let (t, m) = if threads >= 2 {
+            std::thread::scope(|sc| {
+                let h = sc.spawn(|| self.write_messages(msg_path, threads / 2));
+                let t = self.write_trace(trace_path, threads - threads / 2);
+                (t, h.join().expect("message writer panicked"))
+            })
+        } else {
+            (self.write_trace(trace_path, 1), self.write_messages(msg_path, 1))
+        };
+        let ((n_events, trace_sha), (n_messages, message_sha)) = (t?, m?);
+        Ok(Written { n_events, trace_sha, n_messages, message_sha })
+    }
+
+    fn write_trace(&self, path: &Path, threads: usize) -> io::Result<(u64, String)> {
+        let ev = &self.order_events;
+        // Final fill per order id = its last ORDER_EXECUTED event. Order ids are 0..next_order_id.
+        let mut last_exec = vec![u32::MAX; self.next_order_id as usize];
+        for (k, e) in ev.iter().enumerate() {
             if e.kind == K_EXECUTED {
-                last_exec.insert(e.o.id, k);
+                last_exec[e.o.id as usize] = k as u32;
             }
         }
-        // Order rows sorted by (t_ns, order_id), ties in log order.
-        let mut idx: Vec<u32> = (0..self.order_events.len() as u32).collect();
-        idx.sort_by_key(|&k| {
-            let e = &self.order_events[k as usize];
-            (e.t, e.o.id, k)
-        });
+        // Order rows sorted by (t_ns, order_id), ties in log order. The log is already in
+        // nondecreasing t, so only runs of equal t need sorting; anything else gets a full sort.
+        let mut idx: Vec<u32> = (0..ev.len() as u32).collect();
+        if ev.windows(2).all(|w| w[0].t <= w[1].t) {
+            let mut a = 0;
+            while a < idx.len() {
+                let mut b = a + 1;
+                while b < idx.len() && ev[b].t == ev[a].t {
+                    b += 1;
+                }
+                if b - a > 1 {
+                    idx[a..b].sort_unstable_by_key(|&k| (ev[k as usize].o.id, k));
+                }
+                a = b;
+            }
+        } else {
+            idx.sort_unstable_by_key(|&k| (ev[k as usize].t, ev[k as usize].o.id, k));
+        }
 
         // Quote rows: one per (t_ns, side), values from the last emission, placed at the first.
         // Events are emitted in nondecreasing t, so (t, side) groups are contiguous runs of equal t.
@@ -1057,85 +1130,95 @@ impl Sim {
             }
         }
 
-        let n = idx.len() + quotes.len();
-        let mut tr = TraceCols {
-            t_ns: Vec::with_capacity(n),
-            agent_id: Vec::with_capacity(n),
-            msg_type: Vec::with_capacity(n),
-            side: Vec::with_capacity(n),
-            price: Vec::with_capacity(n),
-            size: Vec::with_capacity(n),
-            order_id: Vec::with_capacity(n),
-        };
-        let mut qi = 0;
-        let mut oi = 0;
+        // Row i is quote j (QUOTE | j) or order event k; at equal t quotes (order_id -1) come first.
+        const QUOTE: u32 = 1 << 31;
+        assert!(quotes.len() < QUOTE as usize && ev.len() < QUOTE as usize);
+        let mut rows: Vec<u32> = Vec::with_capacity(idx.len() + quotes.len());
+        let (mut qi, mut oi) = (0, 0);
         while qi < quotes.len() || oi < idx.len() {
-            // At equal t, quotes (order_id -1) precede order rows.
             let take_quote = match (quotes.get(qi), idx.get(oi)) {
-                (Some(q), Some(&k)) => q.0 <= self.order_events[k as usize].t,
+                (Some(q), Some(&k)) => q.0 <= ev[k as usize].t,
                 (Some(_), None) => true,
                 _ => false,
             };
             if take_quote {
-                let (t, side, price, qty) = quotes[qi];
+                rows.push(QUOTE | qi as u32);
                 qi += 1;
-                tr.t_ns.push(t);
-                tr.agent_id.push(0);
-                tr.msg_type.push("QUOTE_UPDATE");
-                tr.side.push(Some(side.name()));
-                tr.price.push(price);
-                tr.size.push(qty);
-                tr.order_id.push(-1);
             } else {
-                let k = idx[oi] as usize;
+                rows.push(idx[oi]);
                 oi += 1;
-                let e = &self.order_events[k];
-                let (msg_type, price) = match e.kind {
-                    K_SUBMITTED => ("ORDER_SUBMITTED", e.o.limit),
-                    K_ACCEPTED => ("ORDER_ACCEPTED", e.o.limit),
-                    K_CANCELLED => ("ORDER_CANCELLED", e.o.limit),
-                    _ => (
-                        if last_exec[&e.o.id] == k { "ORDER_FILLED" } else { "PARTIAL_FILL" },
-                        e.o.fill_price.unwrap(),
-                    ),
-                };
-                tr.t_ns.push(e.t);
-                tr.agent_id.push(e.o.agent as i32);
-                tr.msg_type.push(msg_type);
-                tr.side.push(Some(e.o.side.name()));
-                tr.price.push(price);
-                tr.size.push(e.o.qty);
-                tr.order_id.push(e.o.id);
             }
         }
+        drop(idx);
 
-        let m = self.delivered.len();
-        let mut ms = MsgCols {
-            seq: Vec::with_capacity(m),
-            t_recv_ns: Vec::with_capacity(m),
-            t_send_ns: Vec::with_capacity(m),
-            latency_ns: Vec::with_capacity(m),
-            src_id: Vec::with_capacity(m),
-            dst_id: Vec::with_capacity(m),
-            message_id: Vec::with_capacity(m),
-            msg_type: Vec::with_capacity(m),
-            order_id: Vec::with_capacity(m),
-            causal_parent: Vec::with_capacity(m),
+        let q = |r: u32| &quotes[(r & !QUOTE) as usize];
+        let e = |r: u32| &ev[r as usize];
+        let at = |i: usize| rows[i];
+        let t_ns = |i| { let r = at(i); if r & QUOTE != 0 { q(r).0 } else { e(r).t } };
+        let agent = |i| { let r = at(i); if r & QUOTE != 0 { 0 } else { e(r).o.agent as i32 } };
+        let msg_type = |i| {
+            let r = at(i);
+            if r & QUOTE != 0 {
+                return "QUOTE_UPDATE";
+            }
+            match e(r).kind {
+                K_SUBMITTED => "ORDER_SUBMITTED",
+                K_ACCEPTED => "ORDER_ACCEPTED",
+                K_CANCELLED => "ORDER_CANCELLED",
+                _ if last_exec[e(r).o.id as usize] == r => "ORDER_FILLED",
+                _ => "PARTIAL_FILL",
+            }
         };
-        for (seq, &li) in self.delivered.iter().enumerate() {
-            let r = &self.ledger[li as usize];
-            let wake = r.t_send == i64::MIN;
-            ms.seq.push(seq as i64);
-            ms.t_recv_ns.push(r.t_recv);
-            ms.t_send_ns.push(if wake { None } else { Some(r.t_send) });
-            ms.latency_ns.push(if wake { 0 } else { r.t_recv - r.t_send });
-            ms.src_id.push(r.src as i32);
-            ms.dst_id.push(r.dst as i32);
-            ms.message_id.push(r.message_id);
-            ms.msg_type.push(r.msg_type);
-            ms.order_id.push(r.order_id);
-            ms.causal_parent.push(r.causal);
-        }
-        Outputs { trace: tr, msgs: ms }
+        let side = |i| { let r = at(i); Some(if r & QUOTE != 0 { q(r).1 } else { e(r).o.side }.name()) };
+        let price = |i| {
+            let r = at(i);
+            if r & QUOTE != 0 {
+                return q(r).2;
+            }
+            let x = e(r);
+            if x.kind == K_EXECUTED { x.o.fill_price.unwrap() } else { x.o.limit }
+        };
+        let size = |i| { let r = at(i); if r & QUOTE != 0 { q(r).3 } else { e(r).o.qty } };
+        let order_id = |i| { let r = at(i); if r & QUOTE != 0 { -1 } else { e(r).o.id } };
+        let sha = output::write_trace_cols(
+            path,
+            rows.len(),
+            &[Col::I64(&t_ns), Col::I32(&agent), Col::Str(&msg_type), Col::OptStr(&side), Col::I64(&price), Col::I64(&size), Col::I64(&order_id)],
+            threads,
+        )?;
+        Ok((rows.len() as u64, sha))
+    }
+
+    fn write_messages(&self, path: &Path, threads: usize) -> io::Result<(u64, String)> {
+        let row = |i: usize| &self.msgs[i];
+        let seq = |i: usize| i as i64;
+        let t_recv = |i| row(i).t_recv;
+        let t_send = |i| opt(row(i).t_send);
+        let latency = |i| { let r = row(i); if r.t_send == NONE { 0 } else { r.t_recv - r.t_send } };
+        let src = |i| row(i).src as i32;
+        let dst = |i| row(i).dst as i32;
+        let message_id = |i| row(i).message_id;
+        let msg_type = |i| MSG_TYPES[row(i).msg_type as usize];
+        let order_id = |i| opt(row(i).order_id);
+        let causal = |i| opt(row(i).causal);
+        let n = self.msgs.len();
+        let sha = output::write_message_cols(
+            path,
+            n,
+            &[
+                Col::I64(&seq),
+                Col::I64(&t_recv),
+                Col::OptI64(&t_send),
+                Col::I64(&latency),
+                Col::I32(&src),
+                Col::I32(&dst),
+                Col::I64(&message_id),
+                Col::Str(&msg_type),
+                Col::OptI64(&order_id),
+                Col::OptI64(&causal),
+            ],
+            threads,
+        )?;
+        Ok((n as u64, sha))
     }
 }

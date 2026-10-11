@@ -4,7 +4,7 @@
 // {"kind","rows","write_ms":[...],"sha256":"...","deterministic":bool}.
 // Dump format (little endian), produced by tests_py/output_parity.py:
 //   u8 kind ('T' trace | 'M' message_trace), u64 nrows, u64 dict_len, dict JSON {"msg_type":[..],"side":[..]},
-//   then columns in file order. Ints: raw LE. Strings: u8 codes into dict (255 = null).
+//   then columns in file order. Ints: raw LE. Strings: u16 LE codes into dict (65535 = null).
 //   Nullable ints (t_send_ns, order_id, causal_parent): i64 values then u8 mask (1 = null).
 #[path = "../output.rs"]
 mod output;
@@ -38,8 +38,8 @@ impl<'a> Rd<'a> {
         let mask = self.take(n);
         v.iter().zip(mask).map(|(x, m)| if *m == 1 { None } else { Some(*x) }).collect()
     }
-    fn codes(&mut self, n: usize) -> Vec<u8> {
-        self.take(n).to_vec()
+    fn codes(&mut self, n: usize) -> Vec<u16> {
+        self.take(n * 2).chunks_exact(2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect()
     }
 }
 
@@ -67,7 +67,7 @@ fn main() {
             t_ns: r.i64s(n),
             agent_id: r.i32s(n),
             msg_type: r.codes(n).iter().map(|&c| mt[c as usize]).collect(),
-            side: r.codes(n).iter().map(|&c| if c == 255 { None } else { Some(sd[c as usize]) }).collect(),
+            side: r.codes(n).iter().map(|&c| if c == 65535 { None } else { Some(sd[c as usize]) }).collect(),
             price: r.i64s(n),
             size: r.i64s(n),
             order_id: r.i64s(n),

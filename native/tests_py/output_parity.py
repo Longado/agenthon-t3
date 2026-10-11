@@ -1,6 +1,7 @@
 """Parity test for src/output.rs against pandas/pyarrow-written reference parquet files.
 
-Two phases (so the same Rust outputs can be checked under several pandas versions):
+Two phases (so the same Rust outputs can be checked under several pandas versions; run `gen` under the baseline
+pandas 1.5.3 / pyarrow 15 env so the extra-case references are what the Python baseline would write):
   gen   (needs pandas+numpy): read reference parquet -> dump columns -> run `outcheck` -> ours.parquet
   check (any env): assert pd.read_parquet(ours) is IDENTICAL to pd.read_parquet(ref), plus arrow/parquet schema.
 
@@ -33,7 +34,7 @@ def dump(df, kind, path):
     for c in ("msg_type", "side"):
         if c in df:
             cd, un = pd.factorize(df[c])
-            codes_of[c] = (np.where(cd < 0, 255, cd).astype("uint8"), [str(u) for u in un])
+            codes_of[c] = (np.where(cd < 0, 65535, cd).astype("<u2"), [str(u) for u in un])
     d = {"msg_type": codes_of["msg_type"][1], "side": codes_of.get("side", (None, []))[1]}
     dj = json.dumps(d).encode()
     out = [struct.pack("<BQQ", ord(FILES[kind]), n, len(dj)), dj]
@@ -49,12 +50,15 @@ def dump(df, kind, path):
     open(path, "wb").write(b"".join(out))
 
 
-def run_case(name, df, kind, work, outcheck, ref_path=None):
+def run_case(name, df, kind, work, outcheck, refs, ref_path=None):
     d = os.path.join(work, name)
     os.makedirs(d, exist_ok=True)
-    if ref_path is None:  # extra case: pandas writes its own reference
+    if ref_path is None:  # extra case: pandas writes its own reference (run gen under the baseline env: pandas 1.5.3)
         ref_path = os.path.join(d, kind + ".ref.parquet")
         df.to_parquet(ref_path, compression="snappy", index=False)
+        ref_rel = "work:" + name + "/" + kind + ".ref.parquet"
+    else:
+        ref_rel = "refs:" + os.path.relpath(ref_path, refs)
     dump(df, kind, os.path.join(d, kind + ".bin"))
     ours = os.path.join(d, kind + ".parquet")
     r = subprocess.run([outcheck, os.path.join(d, kind + ".bin"), ours, "5"], capture_output=True, text=True)
@@ -62,7 +66,7 @@ def run_case(name, df, kind, work, outcheck, ref_path=None):
     st = json.loads(r.stdout)
     assert st["deterministic"], (name, kind)
     assert st["sha256"] == hashlib.sha256(open(ours, "rb").read()).hexdigest()  # sha256_file == hashlib
-    json.dump(dict(st, ref=ref_path), open(os.path.join(d, kind + ".json"), "w"))
+    json.dump(dict(st, ref=ref_rel), open(os.path.join(d, kind + ".json"), "w"))
     return st
 
 
@@ -74,26 +78,44 @@ def cases(a):
             yield n, kind, os.path.join(a.refs, n, kind + ".parquet")
 
 
+def extremes(kind, n):
+    """Full-range ints (delta overflow / 64-bit widths), runs, many-distinct strings (dict index width > 8), nulls."""
+    rng = np.random.default_rng(7)
+    i64 = lambda: rng.integers(-2**63, 2**63 - 1, n, dtype=np.int64, endpoint=True)
+    i32 = lambda: rng.integers(-2**31, 2**31 - 1, n, dtype=np.int32, endpoint=True)
+    alt = np.where(np.arange(n) % 2 == 0, np.iinfo(np.int64).min, np.iinfo(np.int64).max).astype(np.int64)
+    mt = pd.Series([f"type_{i % 3001}" for i in range(n)], dtype="string")
+    nul = lambda x: pd.Series(x, dtype="Int64").mask(rng.random(n) < 0.3)
+    if kind == "trace":
+        side = pd.Series(rng.choice(["BID", "ASK", "x\u00e9\u4e2d"], n), dtype="string").mask(rng.random(n) < 0.2)
+        return pd.DataFrame({"t_ns": i64(), "agent_id": i32(), "msg_type": mt, "side": side, "price": alt,
+                             "size": np.full(n, 5, dtype=np.int64), "order_id": np.cumsum(rng.integers(0, 3, n)).astype(np.int64)})
+    return pd.DataFrame({"seq": np.arange(n, dtype=np.int64), "t_recv_ns": i64(), "t_send_ns": nul(i64()),
+                         "latency_ns": alt, "src_id": i32(), "dst_id": np.full(n, -7, dtype=np.int32), "message_id": i64(),
+                         "msg_type": mt, "order_id": nul(i64()), "causal_parent": nul(np.cumsum(rng.integers(0, 3, n)).astype(np.int64))})
+
+
 def gen(a):
     for n, kind, p in cases(a):
         df = pd.read_parquet(p)
-        st = run_case(n, df, kind, a.work, a.outcheck, ref_path=p)
+        st = run_case(n, df, kind, a.work, a.outcheck, a.refs, ref_path=p)
         print(f"gen {n}/{kind} rows={st['rows']} write_ms(min)={min(st['write_ms']):.1f}")
     # extra: empty frames and null sides (reference written by pandas in this env)
     for kind in FILES:
         base = pd.read_parquet(os.path.join(a.refs, "s001_price_time_priority", kind + ".parquet"))
-        run_case("extra_empty", base.head(0), kind, a.work, a.outcheck)
+        run_case("extra_empty", base.head(0), kind, a.work, a.outcheck, a.refs)
+        run_case("extra_extremes", extremes(kind, 200_003), kind, a.work, a.outcheck, a.refs)
         if kind == "trace":
             nb = base.copy()
             nb.loc[nb.index[::7], "side"] = pd.NA
-            run_case("extra_null_side", nb, kind, a.work, a.outcheck)
+            run_case("extra_null_side", nb, kind, a.work, a.outcheck, a.refs)
             nb = nb.iloc[::-1].reset_index(drop=True)
             nb.loc[:, "price"] = -nb["price"]  # negatives
-            run_case("extra_null_side_neg", nb, kind, a.work, a.outcheck)
+            run_case("extra_null_side_neg", nb, kind, a.work, a.outcheck, a.refs)
         else:
             nb = base.copy()
             nb.loc[nb.index[::3], ["t_send_ns", "order_id", "causal_parent"]] = pd.NA
-            run_case("extra_null_int", nb, kind, a.work, a.outcheck)
+            run_case("extra_null_int", nb, kind, a.work, a.outcheck, a.refs)
 
 
 def check(a):
@@ -106,9 +128,9 @@ def check(a):
             if not os.path.exists(j):
                 continue
             st = json.load(open(j))
-            ours, ref = os.path.join(d, kind + ".parquet"), st["ref"]
-            if not os.path.exists(ref):  # reference moved between envs (docker mount): re-resolve
-                ref = os.path.join(a.refs, os.path.basename(os.path.dirname(ref)), kind + ".parquet")
+            ours = os.path.join(d, kind + ".parquet")
+            where, rel = st["ref"].split(":", 1)  # paths differ between envs (docker mounts)
+            ref = os.path.join(a.refs if where == "refs" else a.work, rel)
             do, dr = pd.read_parquet(ours), pd.read_parquet(ref)
             pd.testing.assert_frame_equal(do, dr, check_dtype=True, check_index_type=True)
             assert list(do.dtypes.astype(str)) == list(dr.dtypes.astype(str)) and list(do.columns) == list(dr.columns)
@@ -117,7 +139,7 @@ def check(a):
             assert so.equals(sr, check_metadata=True), (so, sr)
             assert [(f.name, str(f.type), f.nullable) for f in so] == [(f.name, str(f.type), f.nullable) for f in sr]
             fo, fr = pq.ParquetFile(ours), pq.ParquetFile(ref)
-            assert str(fo.schema) == str(fr.schema), (fo.schema, fr.schema)
+            assert fo.schema.equals(fr.schema), (fo.schema, fr.schema)
             assert fo.metadata.num_rows == fr.metadata.num_rows
             assert [fo.metadata.row_group(i).num_rows for i in range(fo.metadata.num_row_groups)] == \
                    [fr.metadata.row_group(i).num_rows for i in range(fr.metadata.num_row_groups)] or len(dr) == 0

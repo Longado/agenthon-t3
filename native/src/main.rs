@@ -51,42 +51,42 @@ fn prepare(config_path: &Path, seed: Option<i64>) -> Result<Prepared, String> {
 }
 
 /// Run one prepared scenario and write trace.parquet, message_trace.parquet, events.json.
-fn run_one(p: Prepared, trace_path: &Path) -> std::io::Result<Value> {
+/// `threads` is this scenario's CPU budget; `leak` skips freeing the simulation state (the
+/// process is about to exit, and unmapping hundreds of MB is measurable).
+fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::io::Result<Value> {
     let t0 = Instant::now();
     let scenario_id = p.cfg.scenario_id.clone();
     let mut s = sim::Sim::new(p.cfg);
     s.run();
     let t_run = t0.elapsed();
-    let out = s.outputs();
-    let t_asm = t0.elapsed();
     let dir = trace_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
-    let msg_path = dir.join("message_trace.parquet");
-    std::thread::scope(|sc| -> std::io::Result<()> {
-        let h = sc.spawn(|| output::write_message_trace(&msg_path, &out.msgs));
-        output::write_trace(trace_path, &out.trace)?;
-        h.join().expect("writer thread panicked")
-    })?;
+    let w = s.write_outputs(trace_path, &dir.join("message_trace.parquet"), threads)?;
     if std::env::var_os("T3SIM_TIMING").is_some() {
-        eprintln!("t3sim timing: run {:?} assemble {:?} write {:?}", t_run, t_asm - t_run, t0.elapsed() - t_asm);
+        eprintln!("t3sim timing: run {:?} write {:?} (threads {threads})", t_run, t0.elapsed() - t_run);
     }
-    let n_events = out.trace.t_ns.len() as u64;
-    let n_messages = out.msgs.seq.len() as u64;
+    if leak {
+        std::mem::forget(s);
+    }
     let wall = t0.elapsed().as_secs_f64();
     let events = json!({
         "scenario_id": scenario_id,
         "seed": p.seed,
-        "n_events": n_events,
+        "n_events": w.n_events,
         "wall_clock_sec": wall,
-        "events_per_sec": if wall > 0.0 { n_events as f64 / wall } else { 0.0 },
-        "trace_sha256": output::sha256_file(trace_path)?,
-        "n_messages": n_messages,
-        "message_trace_sha256": output::sha256_file(&msg_path)?,
+        "events_per_sec": if wall > 0.0 { w.n_events as f64 / wall } else { 0.0 },
+        "trace_sha256": w.trace_sha,
+        "n_messages": w.n_messages,
+        "message_trace_sha256": w.message_sha,
         "peak_memory_bytes": peak_rss_bytes(),
         "gpu_seconds": 0.0,
     });
     std::fs::write(dir.join("events.json"), serde_json::to_string_pretty(&events)? + "\n")?;
     Ok(events)
+}
+
+fn cpu_budget() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
@@ -119,7 +119,7 @@ fn cmd_simulate(args: &[String]) {
         Ok(p) => p,
         Err(why) => fallback(py, args, &why),
     };
-    match run_one(prepared, Path::new(&out)) {
+    match run_one(prepared, Path::new(&out), cpu_budget(), true) {
         Ok(ev) => println!("{ev}"),
         Err(e) => {
             eprintln!("t3sim: write failed: {e}");
@@ -155,7 +155,7 @@ fn cmd_batch(args: &[String]) {
     }
     let out_dir = PathBuf::from(out_dir);
     let names: Vec<String> = subs.iter().map(|p| p.file_stem().unwrap().to_string_lossy().into_owned()).collect();
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(prepared.len());
+    let workers = cpu_budget().min(prepared.len());
     // Subs are independent simulations; run them on all available cores, results kept in sub order.
     let jobs: Vec<(usize, Prepared)> = prepared.into_iter().enumerate().collect();
     let queue = std::sync::Mutex::new(jobs.into_iter());
@@ -165,7 +165,7 @@ fn cmd_batch(args: &[String]) {
             sc.spawn(|| loop {
                 let next = queue.lock().unwrap().next();
                 let Some((i, p)) = next else { break };
-                let r = run_one(p, &out_dir.join(&names[i]).join("trace.parquet"));
+                let r = run_one(p, &out_dir.join(&names[i]).join("trace.parquet"), 1, false);
                 *results[i].lock().unwrap() = Some(r);
             });
         }
