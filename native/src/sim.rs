@@ -198,6 +198,11 @@ impl Entry {
     }
 }
 
+/// `Sim::front` value for an agent with no requeued message; above every real key.
+const NO_FRONT: u64 = u64::MAX;
+/// Set in `Entry::slot` on an agent's front message (see run_kernel); slot numbers stay below it.
+const FRONT: u32 = 1 << 31;
+
 impl Ord for Entry {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -704,6 +709,11 @@ pub struct Sim {
     agent_times: Vec<i64>,
     comp_delay: Vec<i64>,
     heap: BinaryHeap<Entry>,
+    /// Per agent: the key of its "front" message (the one of its requeued messages that stays in
+    /// `heap`, NO_FRONT if none) and the requeued messages parked behind it (time 0, so the
+    /// BinaryHeap orders them by key). See run_kernel.
+    front: Vec<u64>,
+    parked: Vec<BinaryHeap<Entry>>,
     slots: Vec<Msg>,
     slot_rows: Vec<SendRow>,
     free_slots: Vec<u32>,
@@ -806,6 +816,8 @@ impl Sim {
             agent_times: vec![cfg.date_ns; n_agents],
             comp_delay: vec![50; n_agents],
             heap: BinaryHeap::new(),
+            front: vec![NO_FRONT; n_agents],
+            parked: (0..n_agents).map(|_| BinaryHeap::new()).collect(),
             slots: Vec::new(),
             slot_rows: Vec::new(),
             free_slots: Vec::new(),
@@ -851,6 +863,7 @@ impl Sim {
                 s
             }
             None => {
+                assert!(self.slots.len() < FRONT as usize, "message slots exhausted");
                 self.slots.push(m);
                 self.slot_rows.push(row);
                 (self.slots.len() - 1) as u32
@@ -1005,15 +1018,32 @@ impl Sim {
             let e = *top;
             self.current_time = e.time;
             let r = e.recipient() as usize;
-            if self.agent_times[r] > e.time {
-                // Requeue at the agent's time: same queue contents as pop + push, one sift.
-                top.time = self.agent_times[r];
+            let busy_until = self.agent_times[r];
+            if busy_until > e.time {
+                // Python requeues at the agent's time. Every requeued message of a busy agent then
+                // sits at that same time, ordered by key, and is requeued again after each message
+                // the agent handles: quadratic in a burst. Only the agent's lowest-keyed requeued
+                // message (its front) stays in the heap; the rest park and the next one enters
+                // when the front is handled, already at the agent's new time. A parked message's
+                // skipped requeues are pops at the time of a message just handled, so the stop
+                // test never fires on one: the handled order and the stop point are unchanged.
+                if e.key > self.front[r] {
+                    PeekMut::pop(top);
+                    self.parked[r].push(Entry { time: 0, slot: e.slot & !FRONT, ..e });
+                } else {
+                    // A lower key takes over; the old front stays queued, its flag now stale.
+                    self.front[r] = e.key;
+                    top.time = busy_until; // pop + push in one sift
+                    top.slot |= FRONT;
+                }
                 continue;
             }
             PeekMut::pop(top);
+            let was_front = e.slot & FRONT != 0 && e.key == self.front[r];
+            let slot = e.slot & !FRONT;
             self.agent_times[r] = e.time;
-            let msg = std::mem::replace(&mut self.slots[e.slot as usize], Msg::Wakeup);
-            self.free_slots.push(e.slot);
+            let msg = std::mem::replace(&mut self.slots[slot as usize], Msg::Wakeup);
+            self.free_slots.push(slot);
             if let Msg::Wakeup = msg {
                 self.causal = Some(e.msg_id());
                 self.push_msg(MsgRow {
@@ -1031,7 +1061,7 @@ impl Sim {
             } else {
                 self.agent_times[r] += self.comp_delay[r];
                 self.causal = Some(e.msg_id());
-                let w = self.slot_rows[e.slot as usize];
+                let w = self.slot_rows[slot as usize];
                 self.push_msg(MsgRow {
                     message_id: e.msg_id(),
                     t_send: w.t_send,
@@ -1043,6 +1073,15 @@ impl Sim {
                     msg_type: w.msg_type,
                 });
                 self.receive(e.recipient(), e.time, e.sender(), msg);
+            }
+            if was_front {
+                self.front[r] = match self.parked[r].pop() {
+                    Some(p) => {
+                        self.heap.push(Entry { time: self.agent_times[r], slot: p.slot | FRONT, ..p });
+                        p.key
+                    }
+                    None => NO_FRONT,
+                };
             }
         }
     }
