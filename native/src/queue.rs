@@ -33,61 +33,63 @@ impl Entry {
     fn rank(&self) -> u128 {
         ((self.time as u64 ^ 1 << 63) as u128) << 64 | self.key as u128
     }
+    #[inline(always)]
+    fn unrank(r: u128, slot: u32) -> Self {
+        Entry { time: ((r >> 64) as u64 ^ 1 << 63) as i64, key: r as u64, slot }
+    }
 }
 
-/// Min-queue on (time, key): a 4-ary heap. std's binary heap spent about a third of a run
-/// guessing which of two children is smaller; here each level picks the least of four with
-/// selects instead of branches, over half as many levels. Keys are unique, so the pop order
-/// is the same whatever the heap shape.
+/// Min-queue on (time, key): a 4-ary heap of ranks, slots alongside. std's binary heap of
+/// entries spent about a third of a run guessing which of two children is smaller; here each
+/// level picks the least of four 16-byte ranks with selects instead of branches, over half as
+/// many levels. Keys are unique, so the pop order is the same whatever the heap shape.
 ///
 /// The kernel takes the least entry with `take_top`, which leaves the root open: the handler's
 /// first push fills it with one sift down, short because most pushes are near-term, where a
 /// pop sifts to the bottom and the push sifts back up. `close` pops properly if none came.
 #[derive(Default)]
 pub struct Queue {
-    h: Vec<Entry>,
+    r: Vec<u128>,
+    s: Vec<u32>,
     open: bool,
 }
 
 impl Queue {
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.h.is_empty()
+        self.r.is_empty()
     }
 
     /// The least entry (the queue must not be empty).
     #[inline]
     pub fn top(&self) -> Entry {
-        self.h[0]
+        Entry::unrank(self.r[0], self.s[0])
     }
 
     pub fn push(&mut self, x: Entry) {
+        let r = x.rank();
         if self.open {
             self.open = false;
-            return self.sift_down(x);
+            return self.sift_down(r, x.slot);
         }
-        let r = x.rank();
-        let mut i = self.h.len();
-        self.h.push(x);
+        let mut i = self.r.len();
+        self.r.push(r);
+        self.s.push(x.slot);
         while i > 0 {
             let p = (i - 1) / 4;
-            if self.h[p].rank() < r {
+            if self.r[p] < r {
                 break;
             }
-            self.h[i] = self.h[p];
+            (self.r[i], self.s[i]) = (self.r[p], self.s[p]);
             i = p;
         }
-        self.h[i] = x;
+        (self.r[i], self.s[i]) = (r, x.slot);
     }
 
     /// Remove and return the least entry (the queue must not be empty).
     pub fn pop(&mut self) -> Entry {
-        let last = self.h.pop().unwrap();
-        if self.h.is_empty() {
-            return last;
-        }
-        let top = self.h[0];
-        self.sift_down(last);
+        let top = self.top();
+        self.remove_root();
         top
     }
 
@@ -95,7 +97,7 @@ impl Queue {
     #[inline]
     pub fn take_top(&mut self) -> Entry {
         self.open = true;
-        self.h[0]
+        self.top()
     }
 
     /// Pop the entry `take_top` returned if no push has replaced it.
@@ -103,38 +105,40 @@ impl Queue {
     pub fn close(&mut self) {
         if self.open {
             self.open = false;
-            let last = self.h.pop().unwrap();
-            if !self.h.is_empty() {
-                self.sift_down(last);
-            }
+            self.remove_root();
         }
     }
 
     /// Give the least entry a later time and a new slot word, then restore the order.
     pub fn requeue_top(&mut self, time: i64, slot: u32) {
-        self.sift_down(Entry { time, slot, ..self.h[0] });
+        self.sift_down(Entry { time, slot, ..self.top() }.rank(), slot);
     }
 
-    /// Put `x` in the root's place and move it down to where it belongs.
     #[inline(always)]
-    fn sift_down(&mut self, x: Entry) {
-        let r = x.rank();
-        let n = self.h.len();
+    fn remove_root(&mut self) {
+        let (r, s) = (self.r.pop().unwrap(), self.s.pop().unwrap());
+        if !self.r.is_empty() {
+            self.sift_down(r, s);
+        }
+    }
+
+    /// Put (r, s) in the root's place and move it down to where it belongs.
+    #[inline(always)]
+    fn sift_down(&mut self, r: u128, s: u32) {
+        let n = self.r.len();
         let mut i = 0;
         loop {
             let c = 4 * i + 1;
-            let (m, rm) = if c + 3 < n {
-                let h = &self.h;
-                let (k0, k1, k2, k3) = (h[c].rank(), h[c + 1].rank(), h[c + 2].rank(), h[c + 3].rank());
-                let (a, ka) = if k1 < k0 { (c + 1, k1) } else { (c, k0) };
-                let (b, kb) = if k3 < k2 { (c + 3, k3) } else { (c + 2, k2) };
-                if kb < ka { (b, kb) } else { (a, ka) }
+            let (m, rm) = if c + 4 <= n {
+                let h = &self.r[c..c + 4];
+                let (a, ka) = if h[1] < h[0] { (1, h[1]) } else { (0, h[0]) };
+                let (b, kb) = if h[3] < h[2] { (3, h[3]) } else { (2, h[2]) };
+                if kb < ka { (c + b, kb) } else { (c + a, ka) }
             } else if c < n {
-                let mut m = (c, self.h[c].rank());
+                let mut m = (c, self.r[c]);
                 for j in c + 1..n {
-                    let k = self.h[j].rank();
-                    if k < m.1 {
-                        m = (j, k);
+                    if self.r[j] < m.1 {
+                        m = (j, self.r[j]);
                     }
                 }
                 m
@@ -144,10 +148,10 @@ impl Queue {
             if r < rm {
                 break;
             }
-            self.h[i] = self.h[m];
+            (self.r[i], self.s[i]) = (rm, self.s[m]);
             i = m;
         }
-        self.h[i] = x;
+        (self.r[i], self.s[i]) = (r, s);
     }
 }
 
