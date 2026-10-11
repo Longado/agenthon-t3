@@ -139,7 +139,7 @@ const ENC_DELTA: i32 = 5;
 const ENC_RLE_DICT: i32 = 8;
 
 /// One column chunk under construction: dictionary page (optional) then data pages.
-struct Chunk {
+pub struct Chunk {
     buf: Vec<u8>,
     uncompressed: i64,
     first_data: Option<usize>,
@@ -147,7 +147,8 @@ struct Chunk {
     num_values: i64,
 }
 
-struct Scratch {
+/// Per-thread encoder state.
+pub struct Scratch {
     snap: snap::raw::Encoder,
     comp: Vec<u8>,
 }
@@ -378,17 +379,25 @@ fn encode_col(col: &Col, start: usize, end: usize, sc: &mut Scratch) -> Chunk {
     c
 }
 
-fn new_scratch() -> Scratch {
+pub fn new_scratch() -> Scratch {
     Scratch { snap: snap::raw::Encoder::new(), comp: Vec::new() }
+}
+
+/// Number of independent encode jobs for `n` rows of `ncols` columns: one per (row group, column).
+pub fn n_jobs(n: usize, ncols: usize) -> usize {
+    n.div_ceil(ROW_GROUP) * ncols
+}
+
+/// Encodes job `j` (row group `j / cols.len()`, column `j % cols.len()`).
+pub fn encode_job(cols: &[Col], n: usize, j: usize, sc: &mut Scratch) -> Chunk {
+    let (rg, c) = (j / cols.len(), j % cols.len());
+    encode_col(&cols[c], rg * ROW_GROUP, ((rg + 1) * ROW_GROUP).min(n), sc)
 }
 
 /// Encodes every (row group, column) chunk, on `threads` scoped workers when `threads > 1`.
 fn encode_all(cols: &[Col], n: usize, threads: usize) -> Vec<Chunk> {
-    let jobs = n.div_ceil(ROW_GROUP) * cols.len();
-    let job = |j: usize, sc: &mut Scratch| {
-        let (rg, c) = (j / cols.len(), j % cols.len());
-        encode_col(&cols[c], rg * ROW_GROUP, ((rg + 1) * ROW_GROUP).min(n), sc)
-    };
+    let jobs = n_jobs(n, cols.len());
+    let job = |j: usize, sc: &mut Scratch| encode_job(cols, n, j, sc);
     if threads <= 1 || jobs <= 1 {
         let mut sc = new_scratch();
         return (0..jobs).map(|j| job(j, &mut sc)).collect();
@@ -422,6 +431,19 @@ fn write_file(
     cols: &[Col],
     threads: usize,
 ) -> io::Result<String> {
+    let chunks = encode_all(cols, n, threads);
+    assemble(path, schema, pandas_json, arrow_schema_b64, n, chunks)
+}
+
+/// Serializes already-encoded chunks (job order) into a parquet file at `path`; returns its SHA-256.
+fn assemble(
+    path: &Path,
+    schema: &str,
+    pandas_json: &str,
+    arrow_schema_b64: &str,
+    n: usize,
+    chunks: Vec<Chunk>,
+) -> io::Result<String> {
     let schema = Arc::new(parse_message_type(schema).map_err(err)?);
     let props = Arc::new(
         WriterProperties::builder()
@@ -432,10 +454,10 @@ fn write_file(
             ]))
             .build(),
     );
-    let mut chunks = encode_all(cols, n, threads).into_iter();
+    let mut chunks = chunks.into_iter();
     let mut file: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut w = SerializedFileWriter::new(&mut file, schema, props).map_err(err)?;
-    let descrs: Vec<_> = (0..cols.len()).map(|i| w.schema_descr().column(i)).collect();
+    let descrs: Vec<_> = (0..w.schema_descr().num_columns()).map(|i| w.schema_descr().column(i)).collect();
     let mut start = 0;
     while start < n {
         let end = (start + ROW_GROUP).min(n);
@@ -477,6 +499,18 @@ fn write_file(
 
 fn hex(d: &[u8]) -> String {
     d.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// trace.parquet from chunks encoded with `encode_job` over the 7 trace columns.
+#[allow(dead_code)] // t3sim only; outcheck includes this module too
+pub fn assemble_trace(path: &Path, n: usize, chunks: Vec<Chunk>) -> io::Result<String> {
+    assemble(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, n, chunks)
+}
+
+/// message_trace.parquet from chunks encoded with `encode_job` over the 10 message columns.
+#[allow(dead_code)]
+pub fn assemble_messages(path: &Path, n: usize, chunks: Vec<Chunk>) -> io::Result<String> {
+    assemble(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, n, chunks)
 }
 
 /// trace.parquet; `cols` in schema order: t_ns, agent_id, msg_type, side, price, size, order_id.

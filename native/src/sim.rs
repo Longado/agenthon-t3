@@ -8,8 +8,10 @@ use std::collections::binary_heap::PeekMut;
 use std::collections::{BinaryHeap, HashMap};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
 
-use crate::output::{self, Col};
+use crate::output::{self, Chunk, Col};
 use crate::rng::RandomState;
 use crate::scenario::{AgentKind, Config, LatencyKind};
 
@@ -252,6 +254,15 @@ struct MsgRow {
     dst: u32,
     msg_type: u8,
 }
+
+/// trace.parquet row order: `rows[i]` is order event k, or quote j tagged `QUOTE | j`.
+struct TracePrep {
+    rows: Vec<u32>,
+    quotes: Vec<(i64, Side, i64, i64)>,
+    last_exec: Vec<u32>,
+}
+
+const QUOTE: u32 = 1 << 31;
 
 fn opt(v: i64) -> Option<i64> {
     if v == NONE { None } else { Some(v) }
@@ -1105,22 +1116,59 @@ impl Sim {
     // --- outputs -----------------------------------------------------------------------------
 
     /// abides_fork/trace.py:extract_trace and extract_message_trace, written straight from the
-    /// event logs. `threads` is the CPU budget: >= 2 writes the two files concurrently.
+    /// event logs. All (row group, column) chunks of both files are jobs in one pool on `threads`
+    /// workers: message jobs start at once, trace jobs once the main thread has ordered the rows.
     pub fn write_outputs(&self, trace_path: &Path, msg_path: &Path, threads: usize) -> io::Result<Written> {
+        let n_msgs = self.msgs.len();
+        let m_jobs = output::n_jobs(n_msgs, 10);
+        let m_out: Vec<Mutex<Option<Chunk>>> = (0..m_jobs).map(|_| Mutex::new(None)).collect();
+        let trace: OnceLock<(TracePrep, Vec<Mutex<Option<Chunk>>>)> = OnceLock::new();
+        let next = AtomicUsize::new(0);
+        let work = || {
+            let mut sc = output::new_scratch();
+            self.with_msg_cols(|mc| loop {
+                let j = next.fetch_add(1, Relaxed);
+                if j < m_jobs {
+                    *m_out[j].lock().unwrap() = Some(output::encode_job(mc, n_msgs, j, &mut sc));
+                    continue;
+                }
+                let (prep, t_out) = trace.wait();
+                if j - m_jobs >= t_out.len() {
+                    break;
+                }
+                let c = self.with_trace_cols(prep, |tc| output::encode_job(tc, prep.rows.len(), j - m_jobs, &mut sc));
+                *t_out[j - m_jobs].lock().unwrap() = Some(c);
+            })
+        };
+        std::thread::scope(|sc| {
+            for _ in 1..threads.max(1) {
+                sc.spawn(work);
+            }
+            let prep = self.trace_prep();
+            let t_out = (0..output::n_jobs(prep.rows.len(), 7)).map(|_| Mutex::new(None)).collect();
+            let _ = trace.set((prep, t_out));
+            work();
+        });
+        let take = |v: Vec<Mutex<Option<Chunk>>>| -> Vec<Chunk> {
+            v.into_iter().map(|m| m.into_inner().unwrap().expect("encoded chunk")).collect()
+        };
+        let (prep, t_out) = trace.into_inner().expect("trace prepared");
+        let n_events = prep.rows.len();
+        let (m_chunks, t_chunks) = (take(m_out), take(t_out));
         let (t, m) = if threads >= 2 {
             std::thread::scope(|sc| {
-                let h = sc.spawn(|| self.write_messages(msg_path, threads / 2));
-                let t = self.write_trace(trace_path, threads - threads / 2);
-                (t, h.join().expect("message writer panicked"))
+                let h = sc.spawn(|| output::assemble_messages(msg_path, n_msgs, m_chunks));
+                (output::assemble_trace(trace_path, n_events, t_chunks), h.join().expect("assembler panicked"))
             })
         } else {
-            (self.write_trace(trace_path, 1), self.write_messages(msg_path, 1))
+            (output::assemble_trace(trace_path, n_events, t_chunks), output::assemble_messages(msg_path, n_msgs, m_chunks))
         };
-        let ((n_events, trace_sha), (n_messages, message_sha)) = (t?, m?);
-        Ok(Written { n_events, trace_sha, n_messages, message_sha })
+        Ok(Written { n_events: n_events as u64, trace_sha: t?, n_messages: n_msgs as u64, message_sha: m? })
     }
 
-    fn write_trace(&self, path: &Path, threads: usize) -> io::Result<(u64, String)> {
+    /// Row order of trace.parquet: order events sorted by (t_ns, order_id) with ties in log order,
+    /// merged with the deduplicated quote rows (quotes first at equal t).
+    fn trace_prep(&self) -> TracePrep {
         let ev = &self.order_events;
         // Final fill per order id = its last ORDER_EXECUTED event. Order ids are 0..next_order_id.
         let mut last_exec = vec![u32::MAX; self.next_order_id as usize];
@@ -1129,8 +1177,8 @@ impl Sim {
                 last_exec[e.o.id as usize] = k as u32;
             }
         }
-        // Order rows sorted by (t_ns, order_id), ties in log order. The log is already in
-        // nondecreasing t, so only runs of equal t need sorting; anything else gets a full sort.
+        // The log is already in nondecreasing t, so only runs of equal t need sorting; anything
+        // else gets a full sort.
         let mut idx: Vec<u32> = (0..ev.len() as u32).collect();
         if ev.windows(2).all(|w| w[0].t <= w[1].t) {
             let mut a = 0;
@@ -1165,8 +1213,6 @@ impl Sim {
             }
         }
 
-        // Row i is quote j (QUOTE | j) or order event k; at equal t quotes (order_id -1) come first.
-        const QUOTE: u32 = 1 << 31;
         assert!(quotes.len() < QUOTE as usize && ev.len() < QUOTE as usize);
         let mut rows: Vec<u32> = Vec::with_capacity(idx.len() + quotes.len());
         let (mut qi, mut oi) = (0, 0);
@@ -1184,11 +1230,15 @@ impl Sim {
                 oi += 1;
             }
         }
-        drop(idx);
+        TracePrep { rows, quotes, last_exec }
+    }
 
-        let q = |r: u32| &quotes[(r & !QUOTE) as usize];
+    /// The 7 trace.parquet columns (schema order) as row accessors over `p`.
+    fn with_trace_cols<R>(&self, p: &TracePrep, f: impl FnOnce(&[Col; 7]) -> R) -> R {
+        let ev = &self.order_events;
+        let q = |r: u32| &p.quotes[(r & !QUOTE) as usize];
         let e = |r: u32| &ev[r as usize];
-        let at = |i: usize| rows[i];
+        let at = |i: usize| p.rows[i];
         let t_ns = |i| { let r = at(i); if r & QUOTE != 0 { q(r).0 } else { e(r).t } };
         let agent = |i| { let r = at(i); if r & QUOTE != 0 { 0 } else { e(r).o.agent as i32 } };
         let msg_type = |i| {
@@ -1200,7 +1250,7 @@ impl Sim {
                 K_SUBMITTED => "ORDER_SUBMITTED",
                 K_ACCEPTED => "ORDER_ACCEPTED",
                 K_CANCELLED => "ORDER_CANCELLED",
-                _ if last_exec[e(r).o.id as usize] == r => "ORDER_FILLED",
+                _ if p.last_exec[e(r).o.id as usize] == r => "ORDER_FILLED",
                 _ => "PARTIAL_FILL",
             }
         };
@@ -1215,16 +1265,11 @@ impl Sim {
         };
         let size = |i| { let r = at(i); if r & QUOTE != 0 { q(r).3 } else { e(r).o.qty } };
         let order_id = |i| { let r = at(i); if r & QUOTE != 0 { -1 } else { e(r).o.id } };
-        let sha = output::write_trace_cols(
-            path,
-            rows.len(),
-            &[Col::I64(&t_ns), Col::I32(&agent), Col::Str(&msg_type), Col::OptStr(&side), Col::I64(&price), Col::I64(&size), Col::I64(&order_id)],
-            threads,
-        )?;
-        Ok((rows.len() as u64, sha))
+        f(&[Col::I64(&t_ns), Col::I32(&agent), Col::Str(&msg_type), Col::OptStr(&side), Col::I64(&price), Col::I64(&size), Col::I64(&order_id)])
     }
 
-    fn write_messages(&self, path: &Path, threads: usize) -> io::Result<(u64, String)> {
+    /// The 10 message_trace.parquet columns (schema order) as row accessors over the delivery log.
+    fn with_msg_cols<R>(&self, f: impl FnOnce(&[Col; 10]) -> R) -> R {
         let row = |i: usize| &self.msgs[i];
         let seq = |i: usize| i as i64;
         let t_recv = |i| row(i).t_recv;
@@ -1236,24 +1281,17 @@ impl Sim {
         let msg_type = |i| MSG_TYPES[row(i).msg_type as usize];
         let order_id = |i| opt(row(i).order_id);
         let causal = |i| opt(row(i).causal);
-        let n = self.msgs.len();
-        let sha = output::write_message_cols(
-            path,
-            n,
-            &[
-                Col::I64(&seq),
-                Col::I64(&t_recv),
-                Col::OptI64(&t_send),
-                Col::I64(&latency),
-                Col::I32(&src),
-                Col::I32(&dst),
-                Col::I64(&message_id),
-                Col::Str(&msg_type),
-                Col::OptI64(&order_id),
-                Col::OptI64(&causal),
-            ],
-            threads,
-        )?;
-        Ok((n as u64, sha))
+        f(&[
+            Col::I64(&seq),
+            Col::I64(&t_recv),
+            Col::OptI64(&t_send),
+            Col::I64(&latency),
+            Col::I32(&src),
+            Col::I32(&dst),
+            Col::I64(&message_id),
+            Col::Str(&msg_type),
+            Col::OptI64(&order_id),
+            Col::OptI64(&causal),
+        ])
     }
 }
