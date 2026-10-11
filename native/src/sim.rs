@@ -9,7 +9,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::output::{self, Chunk, Col};
 use crate::rng::RandomState;
@@ -268,8 +268,12 @@ struct TraceRow {
     side: u8,
 }
 
-/// A completed run of message_trace rows: (block index, rows); block b holds rows b*PAGE...
-pub struct MsgBlock(usize, Vec<MsgRow>);
+/// One column of a completed run of message_trace rows: (block index, column, rows); block b
+/// holds rows b*PAGE... Each block is sent once per column so its columns encode in parallel.
+pub struct MsgBlock(usize, usize, Arc<Vec<MsgRow>>);
+
+/// Columns of message_trace.parquet (see msg_cols).
+const MSG_COLS: usize = 10;
 
 const TRACE_TYPES: [&str; 6] = ["QUOTE_UPDATE", "ORDER_SUBMITTED", "ORDER_ACCEPTED", "ORDER_CANCELLED", "ORDER_FILLED", "PARTIAL_FILL"];
 const SIDES: [&str; 2] = ["BID", "ASK"];
@@ -753,10 +757,12 @@ impl Sim {
         if self.msgs.is_empty() {
             return;
         }
-        let block = std::mem::replace(&mut self.msgs, Vec::with_capacity(output::PAGE));
+        let block = Arc::new(std::mem::replace(&mut self.msgs, Vec::with_capacity(output::PAGE)));
         let tx = self.msg_tx.as_ref().expect("message sink");
-        // The receiving side lives until run() returns (MessagePages::collect drains it).
-        tx.send(MsgBlock(self.msg_blocks, block)).expect("message pages receiver alive");
+        // The receiving side lives until run() returns (MessagePages::work drains it).
+        for col in 0..MSG_COLS {
+            tx.send(MsgBlock(self.msg_blocks, col, Arc::clone(&block))).expect("message pages receiver alive");
+        }
         self.msg_blocks += 1;
     }
 
@@ -1388,40 +1394,40 @@ fn msg_cols<R>(block: &[MsgRow], base: usize, f: impl FnOnce(&[Col; 10]) -> R) -
 
 /// Encoded message_trace pages, collected from the blocks `Sim::run` sends.
 pub struct MessagePages {
-    blocks: Mutex<Vec<Option<Vec<Chunk>>>>,
+    blocks: Mutex<Vec<Vec<Option<Chunk>>>>,
     rows: usize,
 }
 
 impl MessagePages {
     /// Encodes blocks from `rx` until every sender is gone. Any number of threads may call this
     /// on the same receiver concurrently; `finish` then yields the pages.
-    pub fn work(rx: &Mutex<mpsc::Receiver<MsgBlock>>, into: &Mutex<Vec<Option<Vec<Chunk>>>>, rows: &AtomicUsize) {
+    pub fn work(rx: &Mutex<mpsc::Receiver<MsgBlock>>, into: &Mutex<Vec<Vec<Option<Chunk>>>>, rows: &AtomicUsize) {
         loop {
             let next = rx.lock().unwrap().recv();
-            let Ok(MsgBlock(b, block)) = next else { break };
-            let pages = msg_cols(&block, b * output::PAGE, |cols| {
-                cols.iter().map(|c| output::encode_page(c, 0, block.len())).collect::<Vec<_>>()
-            });
-            rows.fetch_add(block.len(), Relaxed);
+            let Ok(MsgBlock(b, c, block)) = next else { break };
+            let page = msg_cols(&block, b * output::PAGE, |cols| output::encode_page(&cols[c], 0, block.len()));
+            if c == 0 {
+                rows.fetch_add(block.len(), Relaxed);
+            }
             let mut v = into.lock().unwrap();
             if v.len() <= b {
-                v.resize_with(b + 1, || None);
+                v.resize_with(b + 1, || (0..MSG_COLS).map(|_| None).collect());
             }
-            v[b] = Some(pages);
+            v[b][c] = Some(page);
         }
     }
 
-    pub fn finish(into: Mutex<Vec<Option<Vec<Chunk>>>>, rows: AtomicUsize) -> MessagePages {
+    pub fn finish(into: Mutex<Vec<Vec<Option<Chunk>>>>, rows: AtomicUsize) -> MessagePages {
         MessagePages { blocks: into, rows: rows.into_inner() }
     }
 
     /// [column][page], every block present.
     fn by_column(self) -> Vec<Vec<Chunk>> {
         let blocks = self.blocks.into_inner().unwrap();
-        let mut cols: Vec<Vec<Chunk>> = (0..10).map(|_| Vec::with_capacity(blocks.len())).collect();
+        let mut cols: Vec<Vec<Chunk>> = (0..MSG_COLS).map(|_| Vec::with_capacity(blocks.len())).collect();
         for b in blocks {
-            for (c, page) in b.expect("message block encoded").into_iter().enumerate() {
-                cols[c].push(page);
+            for (c, page) in b.into_iter().enumerate() {
+                cols[c].push(page.expect("message page encoded"));
             }
         }
         cols
