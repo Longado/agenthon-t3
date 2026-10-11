@@ -17,6 +17,7 @@
 //! (row group, column) chunk is encoded as an independent job on `threads` workers, and the
 //! file is assembled in memory so its SHA-256 comes without reading it back.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
@@ -194,6 +195,7 @@ impl Chunk {
         }
         h.push(0);
         self.uncompressed += (h.len() + body.len()) as i64;
+        self.buf.reserve(h.len() + body.len());
         self.buf.extend_from_slice(&h);
         self.buf.extend_from_slice(body);
     }
@@ -201,25 +203,26 @@ impl Chunk {
 
 /// v1 definition levels (max level 1) for `m` rows. `present` = None: all defined (one RLE run).
 fn def_levels(out: &mut Vec<u8>, m: usize, present: Option<&[bool]>) {
-    let mut lv = Vec::new();
+    let len_at = out.len();
+    out.extend_from_slice(&[0; 4]); // byte length, patched below
     match present {
         None => {
-            uleb(&mut lv, (m as u64) << 1);
-            lv.push(1);
+            uleb(out, (m as u64) << 1);
+            out.push(1);
         }
         Some(p) => {
-            uleb(&mut lv, (((m + 7) / 8) as u64) << 1 | 1);
+            uleb(out, (((m + 7) / 8) as u64) << 1 | 1);
             for g in p.chunks(8) {
                 let mut b = 0u8;
                 for (i, x) in g.iter().enumerate() {
                     b |= (*x as u8) << i;
                 }
-                lv.push(b);
+                out.push(b);
             }
         }
     }
-    out.extend_from_slice(&(lv.len() as u32).to_le_bytes());
-    out.extend_from_slice(&lv);
+    let len = (out.len() - len_at - 4) as u32;
+    out[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
 }
 
 /// Appends `vals` bit-packed LSB-first at `width` bits each, zero-padded to a whole byte.
@@ -352,20 +355,6 @@ impl Dict {
     }
 }
 
-fn encode_i64_pages(c: &mut Chunk, vals: impl Fn(usize, usize) -> (Vec<i64>, Option<Vec<bool>>), n: usize, is32: bool, nullable: bool) {
-    let mut body = Vec::new();
-    let mut s = 0;
-    while s < n {
-        let e = (s + PAGE_ROWS).min(n);
-        let (v, present) = vals(s, e);
-        body.clear();
-        def_levels(&mut body, e - s, if nullable { present.as_deref() } else { None });
-        delta_encode(&mut body, &v, is32);
-        c.page(PAGE_DATA, e - s, ENC_DELTA, &body);
-        s = e;
-    }
-}
-
 fn encode_str_chunk(c: &mut Chunk, v: &[Option<&'static str>], all_present: bool) {
     let mut d = Dict::new();
     let ids: Vec<Option<u32>> = v.iter().map(|x| x.map(|s| d.id(s))).collect();
@@ -393,38 +382,27 @@ fn encode_str_chunk(c: &mut Chunk, v: &[Option<&'static str>], all_present: bool
 }
 
 fn encode_col(col: &Col, start: usize, end: usize) -> Chunk {
-    let mut c = Chunk::new();
-    let n = end - start;
-    match col {
-        Col::I64(f) => encode_i64_pages(&mut c, |s, e| ((start + s..start + e).map(|i| f(i)).collect(), None), n, false, false),
-        Col::I32(f) => encode_i64_pages(&mut c, |s, e| ((start + s..start + e).map(|i| f(i) as i64).collect(), None), n, true, false),
-        Col::OptI64(f) => encode_i64_pages(
-            &mut c,
-            |s, e| {
-                let sl: Vec<Option<i64>> = (start + s..start + e).map(|i| f(i)).collect();
-                (sl.iter().flatten().copied().collect(), Some(sl.iter().map(|x| x.is_some()).collect()))
-            },
-            n,
-            false,
-            true,
-        ),
+    let mut c = match col {
         Col::Str(f) => {
             let o: Vec<Option<&'static str>> = (start..end).map(|i| Some(f(i))).collect();
+            let mut c = Chunk::new();
             encode_str_chunk(&mut c, &o, true);
+            return c;
         }
         Col::OptStr(f) => {
             let o: Vec<Option<&'static str>> = (start..end).map(|i| f(i)).collect();
+            let mut c = Chunk::new();
             encode_str_chunk(&mut c, &o, false);
+            return c;
         }
-        Col::Dict(t, _) => {
-            c = dict_chunk(t);
-            let mut s = start;
-            while s < end {
-                let e = (s + PAGE_ROWS).min(end);
-                c.append(&encode_page(col, s, e));
-                s = e;
-            }
-        }
+        Col::Dict(t, _) => dict_chunk(t),
+        _ => Chunk::new(),
+    };
+    let mut s = start;
+    while s < end {
+        let e = (s + PAGE_ROWS).min(end);
+        c.append(&encode_page(col, s, e));
+        s = e;
     }
     c
 }
@@ -448,20 +426,50 @@ fn dict_chunk(table: &[&'static str]) -> Chunk {
 /// Supports the page-independent column kinds (ints and fixed-table strings).
 pub fn encode_page(col: &Col, start: usize, end: usize) -> Chunk {
     debug_assert!(end - start <= PAGE_ROWS);
-    let mut c = Chunk::new();
-    let n = end - start;
-    match col {
-        Col::I64(_) | Col::I32(_) | Col::OptI64(_) => {
-            // A single page: encode_col's page loop runs once.
-            return encode_col(col, start, end);
-        }
-        Col::Dict(t, f) => {
-            let ids: Vec<u32> = (start..end).map(|i| f(i)).collect();
-            dict_data_page(&mut c, t.len(), n, &ids);
-        }
-        Col::Str(_) | Col::OptStr(_) => panic!("first-appearance dictionaries are chunk-level only"),
+    // Per-thread buffers: a fresh allocation per page faults in (and zeroes) new memory each time.
+    thread_local! {
+        static BUF: RefCell<(Vec<i64>, Vec<bool>, Vec<u32>, Vec<u8>)> = RefCell::default();
     }
-    c
+    BUF.with(|b| {
+        let (vals, present, ids, body) = &mut *b.borrow_mut();
+        vals.clear();
+        present.clear();
+        ids.clear();
+        body.clear();
+        let n = end - start;
+        let mut c = Chunk::new();
+        match col {
+            Col::I64(f) => {
+                vals.extend((start..end).map(|i| f(i)));
+                def_levels(body, n, None);
+                delta_encode(body, vals, false);
+            }
+            Col::I32(f) => {
+                vals.extend((start..end).map(|i| f(i) as i64));
+                def_levels(body, n, None);
+                delta_encode(body, vals, true);
+            }
+            Col::OptI64(f) => {
+                for i in start..end {
+                    let v = f(i);
+                    present.push(v.is_some());
+                    if let Some(v) = v {
+                        vals.push(v);
+                    }
+                }
+                def_levels(body, n, Some(present));
+                delta_encode(body, vals, false);
+            }
+            Col::Dict(t, f) => {
+                ids.extend((start..end).map(|i| f(i)));
+                dict_data_page(&mut c, t.len(), n, ids);
+                return c;
+            }
+            Col::Str(_) | Col::OptStr(_) => panic!("first-appearance dictionaries are chunk-level only"),
+        }
+        c.page(PAGE_DATA, n, ENC_DELTA, body);
+        c
+    })
 }
 
 /// RLE_DICTIONARY data page (all rows present) over a dictionary of `dict_len` entries.

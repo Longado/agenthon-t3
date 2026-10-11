@@ -198,6 +198,11 @@ pub fn build(scenario: &Value, seed_override: Option<i64>) -> Result<Config, Uns
     };
     let pipeline_delay = if proto { num_or(exchange, "ack_delay_ns", PyNum::I(0))?.to_int()? } else { 0 };
     let compute_delay = if proto { num_or(exchange, "compute_delay_ns", PyNum::I(0))?.to_int()? } else { 0 };
+    // sim.rs lays out the trace assuming events never go back in time, which holds when no delay
+    // is negative (here and in the latency bounds below).
+    if pipeline_delay < 0 || compute_delay < 0 {
+        return unsup("negative exchange delay");
+    }
 
     let oracle_cfg = match get(scenario, "oracle_config") {
         Some(o) if o.is_object() => o,
@@ -325,6 +330,9 @@ pub fn build(scenario: &Value, seed_override: Option<i64>) -> Result<Config, Uns
     };
     if !(mean_ns.is_finite() && sigma.is_finite() && min_ns.is_finite() && max_ns.is_finite() && alpha.is_finite()) {
         return unsup("non-finite latency params");
+    }
+    if min_ns < 0.0 || max_ns < 0.0 || (matches!(kind, LatencyKind::Constant) && mean_ns < 0.0) {
+        return unsup("negative latency bound");
     }
     if matches!(kind, LatencyKind::LogNormal { .. }) && sigma < 0.0 {
         return unsup("negative lognormal sigma");

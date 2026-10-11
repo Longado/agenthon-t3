@@ -256,14 +256,17 @@ pub struct MsgRow {
     msg_type: u8,
 }
 
-/// trace.parquet row order: `rows[i]` is order event k, or quote j tagged `QUOTE | j`.
-struct TracePrep {
-    rows: Vec<u32>,
-    quotes: Vec<(i64, Side, i64, i64)>,
-    last_exec: Vec<u32>,
+/// One trace.parquet row; `kind` indexes TRACE_TYPES and `side` SIDES.
+#[derive(Clone, Copy)]
+struct TraceRow {
+    t: i64,
+    order_id: i64,
+    price: i64,
+    size: i64,
+    agent: i32,
+    kind: u8,
+    side: u8,
 }
-
-const QUOTE: u32 = 1 << 31;
 
 /// A completed run of message_trace rows: (block index, rows); block b holds rows b*PAGE...
 pub struct MsgBlock(usize, Vec<MsgRow>);
@@ -545,9 +548,13 @@ pub struct Sim {
     close_price_subs: Vec<u32>,
     // traders: index i is agent id i + 1
     traders: Vec<Trader>,
-    // trace
+    // trace: both logs in emission order, which is nondecreasing in t whenever every delay is
+    // non-negative (scenario.rs refuses the rest); `disordered` records a violation anyway.
     order_events: Vec<OrderEvent>,
     quote_events: Vec<QuoteEvent>,
+    last_exec: Vec<u32>, // order id -> index of its last ORDER_EXECUTED event
+    last_event_t: i64,
+    disordered: bool,
 }
 
 pub struct Written {
@@ -635,6 +642,9 @@ impl Sim {
             traders,
             order_events: Vec::new(),
             quote_events: Vec::new(),
+            last_exec: Vec::new(),
+            last_event_t: i64::MIN,
+            disordered: false,
             global,
             oracle,
             latency,
@@ -702,6 +712,34 @@ impl Sim {
         let id = self.new_msg_id();
         let slot = self.store(Msg::Wakeup, WAKE_SEND);
         self.heap.push(Entry::new(t, agent, agent, id, slot));
+    }
+
+    fn note_time(&mut self, t: i64) {
+        self.disordered |= t < self.last_event_t;
+        self.last_event_t = t;
+    }
+
+    fn log_order(&mut self, t: i64, kind: u8, o: Order) {
+        self.note_time(t);
+        if kind == K_EXECUTED {
+            let id = o.id as usize;
+            if self.last_exec.len() <= id {
+                self.last_exec.resize(self.next_order_id as usize, u32::MAX);
+            }
+            self.last_exec[id] = self.order_events.len() as u32;
+        }
+        self.order_events.push(OrderEvent { t, kind, o });
+    }
+
+    fn log_quote(&mut self, q: QuoteEvent) {
+        self.note_time(q.t);
+        self.quote_events.push(q);
+    }
+
+    /// True when trace events were emitted out of time order; the trace layout here assumes
+    /// otherwise, so the caller must not use this run's outputs.
+    pub fn disordered(&self) -> bool {
+        self.disordered
     }
 
     fn push_msg(&mut self, row: MsgRow) {
@@ -843,7 +881,7 @@ impl Sim {
             Msg::MarketClosePrice => {}
             Msg::MarketClosed => self.traders[i].mkt_closed = true,
             Msg::OrderExecuted(o) => {
-                self.order_events.push(OrderEvent { t, kind: K_EXECUTED, o });
+                self.log_order(t, K_EXECUTED, o);
                 let orders = &mut self.traders[i].orders;
                 let remove = match orders.get_mut(o.id) {
                     Some(mine) => {
@@ -860,9 +898,9 @@ impl Sim {
                     orders.remove(o.id);
                 }
             }
-            Msg::OrderAccepted(o) => self.order_events.push(OrderEvent { t, kind: K_ACCEPTED, o }),
+            Msg::OrderAccepted(o) => self.log_order(t, K_ACCEPTED, o),
             Msg::OrderCancelled(o) => {
-                self.order_events.push(OrderEvent { t, kind: K_CANCELLED, o });
+                self.log_order(t, K_CANCELLED, o);
                 self.traders[i].orders.remove(o.id);
             }
             Msg::QuerySpreadResponse { bid, ask, mkt_closed } => {
@@ -898,7 +936,7 @@ impl Sim {
         self.traders[i].orders.insert(o);
         self.send(agent, 0, Msg::LimitOrder(o));
         let t = self.traders[i].current_time;
-        self.order_events.push(OrderEvent { t, kind: K_SUBMITTED, o });
+        self.log_order(t, K_SUBMITTED, o);
     }
 
     fn act(&mut self, agent: u32) {
@@ -1061,10 +1099,12 @@ impl Sim {
         }
         let t = self.ex_time;
         if let Some(l) = self.book.bids.first() {
-            self.quote_events.push(QuoteEvent { t, side: Side::Bid, price: l.price, qty: l.total });
+            let (price, qty) = (l.price, l.total);
+            self.log_quote(QuoteEvent { t, side: Side::Bid, price, qty });
         }
         if let Some(l) = self.book.asks.first() {
-            self.quote_events.push(QuoteEvent { t, side: Side::Ask, price: l.price, qty: l.total });
+            let (price, qty) = (l.price, l.total);
+            self.log_quote(QuoteEvent { t, side: Side::Ask, price, qty });
         }
         if trade_qty > 0 {
             self.book.last_trade = py_round(trade_value as f64 / trade_qty as f64);
@@ -1163,15 +1203,15 @@ impl Sim {
         let write_msgs = move || {
             msg_cols(&[], 0, |cols| output::assemble_message_pages(msg_path, n_msgs, cols, msg_pages.by_column()))
         };
-        let write_trace = |helpers: usize| -> io::Result<(usize, String)> {
-            let prep = self.trace_prep();
-            let n = prep.rows.len();
+        let write_trace = |threads: usize| -> io::Result<(usize, String)> {
+            let segs = self.trace_rows(threads);
+            let n: usize = segs.iter().map(Vec::len).sum();
             let pages = n.div_ceil(output::PAGE);
             let jobs = pages * 7;
             let out: Vec<Mutex<Option<Chunk>>> = (0..jobs).map(|_| Mutex::new(None)).collect();
             let next = AtomicUsize::new(0);
             let work = || {
-                self.with_trace_cols(&prep, |cols| loop {
+                Self::with_trace_cols(&segs, |cols| loop {
                     let j = next.fetch_add(1, Relaxed);
                     if j >= jobs {
                         break;
@@ -1182,48 +1222,61 @@ impl Sim {
                 })
             };
             std::thread::scope(|sc| {
-                for _ in 0..helpers {
+                for _ in 1..threads {
                     sc.spawn(work);
                 }
                 work();
             });
             let mut it = out.into_iter().map(|m| m.into_inner().unwrap().expect("encoded page"));
             let by_col: Vec<Vec<Chunk>> = (0..7).map(|_| it.by_ref().take(pages).collect()).collect();
-            let sha = self.with_trace_cols(&prep, |cols| output::assemble_trace_pages(trace_path, n, cols, by_col))?;
+            let sha = Self::with_trace_cols(&segs, |cols| output::assemble_trace_pages(trace_path, n, cols, by_col))?;
             Ok((n, sha))
         };
         let (t, m) = if threads >= 2 {
             std::thread::scope(|sc| {
                 let h = sc.spawn(write_msgs);
-                let t = write_trace(threads.saturating_sub(2));
+                // The message file is serialized by the time the trace rows are ordered, so the
+                // trace takes the whole budget.
+                let t = write_trace(threads);
                 (t, h.join().expect("message writer panicked"))
             })
         } else {
-            (write_trace(0), write_msgs())
+            (write_trace(1), write_msgs())
         };
         let (n_events, trace_sha) = t?;
         Ok(Written { n_events: n_events as u64, trace_sha, n_messages: n_msgs as u64, message_sha: m? })
     }
 
-    /// Row order of trace.parquet: order events sorted by (t_ns, order_id) with ties in log order,
-    /// merged with the deduplicated quote rows (quotes first at equal t).
-    fn trace_prep(&self) -> TracePrep {
-        let ev = &self.order_events;
-        // Final fill per order id = its last ORDER_EXECUTED event. Order ids are 0..next_order_id.
-        let mut last_exec = vec![u32::MAX; self.next_order_id as usize];
-        for (k, e) in ev.iter().enumerate() {
-            if e.kind == K_EXECUTED {
-                last_exec[e.o.id as usize] = k as u32;
+    /// trace.parquet rows in order, as up to `parts` consecutive segments built in parallel:
+    /// order events sorted by (t_ns, order_id) with ties in log order, merged with one quote row
+    /// per (t_ns, side) (values of its last emission, at its first), quotes first at equal t.
+    /// Segments split the logs at time boundaries, so each one is ordered independently.
+    fn trace_rows(&self, parts: usize) -> Vec<Vec<TraceRow>> {
+        let (ev, qs) = (&self.order_events, &self.quote_events);
+        let parts = parts.max(1);
+        let mut cuts = vec![0];
+        for c in 1..parts {
+            let mut b = (ev.len() * c / parts).max(*cuts.last().unwrap());
+            while b > 0 && b < ev.len() && ev[b].t == ev[b - 1].t {
+                b += 1;
             }
+            cuts.push(b);
         }
-        // The log is already in nondecreasing t, so only runs of equal t need sorting; anything
-        // else gets a full sort.
-        let mut idx: Vec<u32> = (0..ev.len() as u32).collect();
-        if ev.windows(2).all(|w| w[0].t <= w[1].t) {
+        cuts.push(ev.len());
+        let bound = |c: usize| match c {
+            0 => i64::MIN,
+            _ if cuts[c] < ev.len() => ev[cuts[c]].t,
+            _ => i64::MAX,
+        };
+        let qcuts: Vec<usize> = (0..=parts).map(|c| if c == parts { qs.len() } else { qs.partition_point(|q| q.t < bound(c)) }).collect();
+        let segment = |c: usize| -> Vec<TraceRow> {
+            let (oa, ob, qa, qb) = (cuts[c], cuts[c + 1], qcuts[c], qcuts[c + 1]);
+            let mut idx: Vec<u32> = (oa as u32..ob as u32).collect();
             let mut a = 0;
             while a < idx.len() {
+                let t = ev[idx[a] as usize].t;
                 let mut b = a + 1;
-                while b < idx.len() && ev[b].t == ev[a].t {
+                while b < idx.len() && ev[idx[b] as usize].t == t {
                     b += 1;
                 }
                 if b - a > 1 {
@@ -1231,80 +1284,77 @@ impl Sim {
                 }
                 a = b;
             }
-        } else {
-            idx.sort_unstable_by_key(|&k| (ev[k as usize].t, ev[k as usize].o.id, k));
-        }
-
-        // Quote rows: one per (t_ns, side), values from the last emission, placed at the first.
-        // Events are emitted in nondecreasing t, so (t, side) groups are contiguous runs of equal t.
-        let mut quotes: Vec<(i64, Side, i64, i64)> = Vec::new();
-        let mut run_start = 0;
-        for q in &self.quote_events {
-            if quotes.len() > run_start && quotes[run_start].0 != q.t {
-                run_start = quotes.len();
-            }
-            match quotes[run_start..].iter_mut().find(|x| x.1 == q.side) {
-                Some(x) => {
-                    x.2 = q.price;
-                    x.3 = q.qty;
+            let mut quotes: Vec<TraceRow> = Vec::new();
+            let mut run_start = 0;
+            for q in &qs[qa..qb] {
+                if quotes.len() > run_start && quotes[run_start].t != q.t {
+                    run_start = quotes.len();
                 }
-                None => quotes.push((q.t, q.side, q.price, q.qty)),
+                let side = q.side.idx() as u8;
+                match quotes[run_start..].iter_mut().find(|x| x.side == side) {
+                    Some(x) => {
+                        x.price = q.price;
+                        x.size = q.qty;
+                    }
+                    None => quotes.push(TraceRow { t: q.t, order_id: -1, price: q.price, size: q.qty, agent: 0, kind: 0, side }),
+                }
             }
-        }
-
-        assert!(quotes.len() < QUOTE as usize && ev.len() < QUOTE as usize);
-        let mut rows: Vec<u32> = Vec::with_capacity(idx.len() + quotes.len());
-        let (mut qi, mut oi) = (0, 0);
-        while qi < quotes.len() || oi < idx.len() {
-            let take_quote = match (quotes.get(qi), idx.get(oi)) {
-                (Some(q), Some(&k)) => q.0 <= ev[k as usize].t,
-                (Some(_), None) => true,
-                _ => false,
+            let order_row = |k: u32| {
+                let e = &ev[k as usize];
+                let (kind, price) = match e.kind {
+                    K_SUBMITTED => (1, e.o.limit),
+                    K_ACCEPTED => (2, e.o.limit),
+                    K_CANCELLED => (3, e.o.limit),
+                    _ if self.last_exec[e.o.id as usize] == k => (4, e.o.fill_price.unwrap()),
+                    _ => (5, e.o.fill_price.unwrap()),
+                };
+                TraceRow { t: e.t, order_id: e.o.id, price, size: e.o.qty, agent: e.o.agent as i32, kind, side: e.o.side.idx() as u8 }
             };
-            if take_quote {
-                rows.push(QUOTE | qi as u32);
-                qi += 1;
-            } else {
-                rows.push(idx[oi]);
-                oi += 1;
+            let mut rows = Vec::with_capacity(idx.len() + quotes.len());
+            let (mut qi, mut oi) = (0, 0);
+            while qi < quotes.len() || oi < idx.len() {
+                let take_quote = match (quotes.get(qi), idx.get(oi)) {
+                    (Some(q), Some(&k)) => q.t <= ev[k as usize].t,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if take_quote {
+                    rows.push(quotes[qi]);
+                    qi += 1;
+                } else {
+                    rows.push(order_row(idx[oi]));
+                    oi += 1;
+                }
             }
-        }
-        TracePrep { rows, quotes, last_exec }
+            rows
+        };
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = (1..parts).map(|c| sc.spawn(move || segment(c))).collect();
+            let mut segs = vec![segment(0)];
+            segs.extend(hs.into_iter().map(|h| h.join().expect("trace segment panicked")));
+            segs
+        })
     }
 
-    /// The 7 trace.parquet columns (schema order) as row accessors over `p`.
-    fn with_trace_cols<R>(&self, p: &TracePrep, f: impl FnOnce(&[Col; 7]) -> R) -> R {
-        let ev = &self.order_events;
-        let q = |r: u32| &p.quotes[(r & !QUOTE) as usize];
-        let e = |r: u32| &ev[r as usize];
-        let at = |i: usize| p.rows[i];
-        let t_ns = |i| { let r = at(i); if r & QUOTE != 0 { q(r).0 } else { e(r).t } };
-        let agent = |i| { let r = at(i); if r & QUOTE != 0 { 0 } else { e(r).o.agent as i32 } };
-        // Indices into TRACE_TYPES / SIDES.
-        let msg_type = |i| {
-            let r = at(i);
-            if r & QUOTE != 0 {
-                return 0;
-            }
-            match e(r).kind {
-                K_SUBMITTED => 1,
-                K_ACCEPTED => 2,
-                K_CANCELLED => 3,
-                _ if p.last_exec[e(r).o.id as usize] == r => 4,
-                _ => 5,
-            }
+    /// The 7 trace.parquet columns (schema order) as row accessors over consecutive segments.
+    fn with_trace_cols<R>(segs: &[Vec<TraceRow>], f: impl FnOnce(&[Col; 7]) -> R) -> R {
+        let mut offs = Vec::with_capacity(segs.len());
+        let mut n = 0;
+        for s in segs {
+            offs.push(n);
+            n += s.len();
+        }
+        let row = |i: usize| {
+            let s = offs.partition_point(|&o| o <= i) - 1;
+            &segs[s][i - offs[s]]
         };
-        let side = |i| { let r = at(i); if r & QUOTE != 0 { q(r).1 } else { e(r).o.side }.idx() };
-        let price = |i| {
-            let r = at(i);
-            if r & QUOTE != 0 {
-                return q(r).2;
-            }
-            let x = e(r);
-            if x.kind == K_EXECUTED { x.o.fill_price.unwrap() } else { x.o.limit }
-        };
-        let size = |i| { let r = at(i); if r & QUOTE != 0 { q(r).3 } else { e(r).o.qty } };
-        let order_id = |i| { let r = at(i); if r & QUOTE != 0 { -1 } else { e(r).o.id } };
+        let t_ns = |i| row(i).t;
+        let agent = |i| row(i).agent;
+        let msg_type = |i| row(i).kind as u32;
+        let side = |i| row(i).side as u32;
+        let price = |i| row(i).price;
+        let size = |i| row(i).size;
+        let order_id = |i| row(i).order_id;
         f(&[Col::I64(&t_ns), Col::I32(&agent), Col::Dict(&TRACE_TYPES, &msg_type), Col::Dict(&SIDES, &side), Col::I64(&price), Col::I64(&size), Col::I64(&order_id)])
     }
 }

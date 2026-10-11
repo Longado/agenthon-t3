@@ -56,8 +56,9 @@ fn prepare(config_path: &Path, seed: Option<i64>) -> Result<Prepared, String> {
 
 /// Run one prepared scenario and write trace.parquet, message_trace.parquet, events.json.
 /// `threads` is this scenario's CPU budget; `leak` skips freeing the simulation state (the
-/// process is about to exit, and unmapping hundreds of MB is measurable).
-fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::io::Result<Value> {
+/// process is about to exit, and unmapping hundreds of MB is measurable). Ok(None): the run
+/// emitted trace events out of time order, nothing was written, and the caller must fall back.
+fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::io::Result<Option<Value>> {
     let t0 = Instant::now();
     let scenario_id = p.cfg.scenario_id.clone();
     let mut s = sim::Sim::new(p.cfg);
@@ -72,6 +73,9 @@ fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::i
         s.run(tx);
         sim::MessagePages::work(&rx, &pages, &rows);
     });
+    if s.disordered() {
+        return Ok(None);
+    }
     let msg_pages = sim::MessagePages::finish(pages, rows);
     let t_run = t0.elapsed();
     let dir = trace_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
@@ -97,7 +101,7 @@ fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::i
         "gpu_seconds": 0.0,
     });
     std::fs::write(dir.join("events.json"), serde_json::to_string_pretty(&events)? + "\n")?;
-    Ok(events)
+    Ok(Some(events))
 }
 
 fn cpu_budget() -> usize {
@@ -135,7 +139,8 @@ fn cmd_simulate(args: &[String]) {
         Err(why) => fallback(py, args, &why),
     };
     match run_one(prepared, Path::new(&out), cpu_budget(), true) {
-        Ok(ev) => println!("{ev}"),
+        Ok(Some(ev)) => println!("{ev}"),
+        Ok(None) => fallback(py, args, "trace events out of time order"),
         Err(e) => {
             eprintln!("t3sim: write failed: {e}");
             std::process::exit(1);
@@ -174,7 +179,7 @@ fn cmd_batch(args: &[String]) {
     // Subs are independent simulations; run them on all available cores, results kept in sub order.
     let jobs: Vec<(usize, Prepared)> = prepared.into_iter().enumerate().collect();
     let queue = std::sync::Mutex::new(jobs.into_iter());
-    let results: Vec<std::sync::Mutex<Option<std::io::Result<Value>>>> = (0..names.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    let results: Vec<std::sync::Mutex<Option<std::io::Result<Option<Value>>>>> = (0..names.len()).map(|_| std::sync::Mutex::new(None)).collect();
     std::thread::scope(|sc| {
         for _ in 0..workers {
             sc.spawn(|| loop {
@@ -189,7 +194,8 @@ fn cmd_batch(args: &[String]) {
     let mut total: u64 = 0;
     for (i, r) in results.into_iter().enumerate() {
         match r.into_inner().unwrap().unwrap() {
-            Ok(ev) => {
+            Ok(None) => fallback(py, args, &format!("{}: trace events out of time order", names[i])),
+            Ok(Some(ev)) => {
                 let n = ev["n_events"].as_u64().unwrap();
                 total += n;
                 per.push(json!({"sub": names[i], "n_events": n, "trace_sha256": ev["trace_sha256"]}));
