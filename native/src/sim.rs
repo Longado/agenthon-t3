@@ -166,25 +166,40 @@ impl Msg {
 }
 
 /// Heap entry: Python orders `(deliver_at, (sender_id, recipient_id, message))`, and messages
-/// compare by message_id. `slot` points at the payload and its send-time ledger fields.
-#[derive(PartialEq, Eq)]
+/// compare by message_id. `key` packs sender/recipient/message_id as 16/16/32 bits, so the order
+/// is one (i64, u64) comparison: scenario.rs refuses 2^16 or more agents, and message ids are
+/// checked against 2^32 when issued. `slot` points at the payload and its send-time ledger fields.
+#[derive(PartialEq, Eq, Clone, Copy)]
 struct Entry {
     time: i64,
-    sender: u32,
-    recipient: u32,
-    msg_id: i64,
+    key: u64,
     slot: u32,
 }
 
+impl Entry {
+    #[inline]
+    fn new(time: i64, sender: u32, recipient: u32, msg_id: i64, slot: u32) -> Self {
+        Entry { time, key: (sender as u64) << 48 | (recipient as u64) << 32 | msg_id as u64, slot }
+    }
+    #[inline]
+    fn sender(&self) -> u32 {
+        (self.key >> 48) as u32
+    }
+    #[inline]
+    fn recipient(&self) -> u32 {
+        (self.key >> 32) as u32 & 0xffff
+    }
+    #[inline]
+    fn msg_id(&self) -> i64 {
+        (self.key & 0xffff_ffff) as i64
+    }
+}
+
 impl Ord for Entry {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap is a max-heap: reverse for min-first.
-        (other.time, other.sender, other.recipient, other.msg_id).cmp(&(
-            self.time,
-            self.sender,
-            self.recipient,
-            self.msg_id,
-        ))
+        (other.time, other.key).cmp(&(self.time, self.key))
     }
 }
 impl PartialOrd for Entry {
@@ -278,11 +293,27 @@ fn crosses(order: &Order, level_price: i64) -> bool {
 // ---------------------------------------------------------------------------------------------
 // Agents
 
+/// Multiplicative hash for order-id keys; SipHash's flood resistance buys nothing here.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("IdHasher only hashes i64 keys")
+    }
+    fn write_i64(&mut self, v: i64) {
+        self.0 = (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
 /// Insertion-ordered order dict (TradingAgent.orders).
 #[derive(Default)]
 struct OrderDict {
     slots: Vec<Option<Order>>,
-    index: HashMap<i64, usize>,
+    index: HashMap<i64, usize, std::hash::BuildHasherDefault<IdHasher>>,
     live: usize,
 }
 
@@ -590,6 +621,7 @@ impl Sim {
 
     fn new_msg_id(&mut self) -> i64 {
         let id = self.next_msg_id;
+        assert!(id < 1 << 32, "message id exceeds the heap key width");
         self.next_msg_id += 1;
         id
     }
@@ -622,7 +654,7 @@ impl Sim {
             msg_type: msg.type_idx(),
         };
         let slot = self.store(msg, row);
-        self.heap.push(Entry { time: deliver_at, sender, recipient, msg_id, slot });
+        self.heap.push(Entry::new(deliver_at, sender, recipient, msg_id, slot));
     }
 
     fn send(&mut self, sender: u32, recipient: u32, msg: Msg) {
@@ -644,7 +676,7 @@ impl Sim {
         assert!(!(self.current_time != 0 && t < self.current_time), "wakeup in the past");
         let id = self.new_msg_id();
         let slot = self.store(Msg::Wakeup, WAKE_SEND);
-        self.heap.push(Entry { time: t, sender: agent, recipient: agent, msg_id: id, slot });
+        self.heap.push(Entry::new(t, agent, agent, id, slot));
     }
 
     pub fn run(&mut self) {
@@ -660,7 +692,7 @@ impl Sim {
         while !self.heap.is_empty() && self.current_time != 0 && self.current_time <= self.cfg.stop_time {
             let e = self.heap.pop().unwrap();
             self.current_time = e.time;
-            let r = e.recipient as usize;
+            let r = e.recipient() as usize;
             if self.agent_times[r] > e.time {
                 let t = self.agent_times[r];
                 self.heap.push(Entry { time: t, ..e });
@@ -670,34 +702,34 @@ impl Sim {
             let msg = std::mem::replace(&mut self.slots[e.slot as usize], Msg::Wakeup);
             self.free_slots.push(e.slot);
             if let Msg::Wakeup = msg {
-                self.causal = Some(e.msg_id);
+                self.causal = Some(e.msg_id());
                 self.msgs.push(MsgRow {
-                    message_id: e.msg_id,
+                    message_id: e.msg_id(),
                     t_send: NONE,
                     t_recv: e.time,
                     order_id: NONE,
                     causal: NONE,
-                    src: e.recipient,
-                    dst: e.recipient,
+                    src: e.recipient(),
+                    dst: e.recipient(),
                     msg_type: WAKE_ROW,
                 });
-                self.wakeup(e.recipient, e.time);
+                self.wakeup(e.recipient(), e.time);
                 self.agent_times[r] += self.comp_delay[r];
             } else {
                 self.agent_times[r] += self.comp_delay[r];
-                self.causal = Some(e.msg_id);
+                self.causal = Some(e.msg_id());
                 let w = self.slot_rows[e.slot as usize];
                 self.msgs.push(MsgRow {
-                    message_id: e.msg_id,
+                    message_id: e.msg_id(),
                     t_send: w.t_send,
                     t_recv: w.t_recv,
                     order_id: w.order_id,
                     causal: w.causal,
-                    src: e.sender,
-                    dst: e.recipient,
+                    src: e.sender(),
+                    dst: e.recipient(),
                     msg_type: w.msg_type,
                 });
-                self.receive(e.recipient, e.time, e.sender, msg);
+                self.receive(e.recipient(), e.time, e.sender(), msg);
             }
         }
     }

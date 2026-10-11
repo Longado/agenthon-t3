@@ -294,6 +294,11 @@ pub fn build(scenario: &Value, seed_override: Option<i64>) -> Result<Config, Uns
         }
     }
 
+    // sim.rs packs agent ids into 16 bits of the event-queue key (agent 0 is the exchange).
+    if agents.len() >= 0xffff {
+        return unsup("too many agents for the native event queue");
+    }
+
     let latency_cfg = get(scenario, "latency_config");
     if !truthy(latency_cfg) {
         return unsup("no latency_config (ABIDES default latency model)");
