@@ -1,8 +1,9 @@
 """Run every public single-scenario unit through an image, timed the way the Final ranks it.
 
 Per scenario: rows in trace.parquet / Docker's own container window (State.StartedAt -> FinishedAt),
-plus SHA-256 of trace.parquet and message_trace.parquet. With --baseline, every hash must equal the
-baseline run's hash (byte-identical output is our correctness invariant) and the speedup is printed.
+plus SHA-256 of trace.parquet and message_trace.parquet. With --baseline the speedup is printed.
+Output content is checked separately (the native writer's bytes differ from pandas'):
+    python bench/compare.py --outputs <out> --ref <python baseline outputs>
 
     python bench.py --image t3opt:dev --out ~/runs/dev [--baseline ~/runs/bench_base.json] [--only as06]
 """
@@ -85,14 +86,13 @@ def main() -> int:
     bad, ratios = [], []
     for r in res:
         b = base.get(r["name"])
-        same = b is None or (r["trace_sha"] == b["trace_sha"] and r["msg_sha"] == b["msg_sha"])
-        if r["exit"] != 0 or not same:
+        if r["exit"] != 0:
             bad.append(r["name"])
         if b and b["rate"] > 0:
             ratios.append(r["rate"] / b["rate"])
         print(f'{r["name"]:38s} exit={r["exit"]} rows={r["rows"]:>8} {r["window_sec"]:7.2f}s '
               f'{r["rate"]:10.0f}/s' + (f'  x{r["rate"] / b["rate"]:.2f}' if b else "")
-              + ("" if same else "  OUTPUT DIFFERS"))
+              )
     print(f"mean rate {statistics.mean(r['rate'] for r in res):.0f}/s over {len(res)} scenarios")
     if ratios:
         print(f"speedup vs baseline: geo-mean x{statistics.geometric_mean(ratios):.2f}, "

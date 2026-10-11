@@ -1,6 +1,7 @@
 """Run the native binary on public scenarios and diff its outputs against the Python baseline's.
 
     python bench/compare.py --bin native/target/release/t3sim --ref ~/runs/b_official [--only as06,mp01] [--jobs 6]
+    python bench/compare.py --outputs ~/runs/n1 --ref ~/runs/b_official   # diff an existing bench.py run
 
 For each scenario: run `t3sim simulate` (T3SIM_NO_FALLBACK=1, so an unsupported scenario fails
 instead of silently running Python), then compare trace.parquet and message_trace.parquet with
@@ -42,6 +43,18 @@ def first_diff(a: pd.DataFrame, b: pd.DataFrame) -> str:
     return ""
 
 
+def diff_dir(out: pathlib.Path, ref: pathlib.Path) -> str:
+    msgs = []
+    for f in ("trace.parquet", "message_trace.parquet"):
+        if not (out / f).exists():
+            msgs.append(f"[{f}] missing")
+            continue
+        d = first_diff(pd.read_parquet(out / f), pd.read_parquet(ref / f))
+        if d:
+            msgs.append(f"[{f}] {d}")
+    return "\n".join(msgs)
+
+
 def check(binary: str, scen: pathlib.Path, ref_root: pathlib.Path) -> tuple[str, str, float]:
     with tempfile.TemporaryDirectory() as td:
         out = pathlib.Path(td) / "trace.parquet"
@@ -51,18 +64,14 @@ def check(binary: str, scen: pathlib.Path, ref_root: pathlib.Path) -> tuple[str,
         dt = time.perf_counter() - t0
         if p.returncode != 0:
             return scen.stem, f"exit {p.returncode}: {p.stderr.strip()[-400:]}", dt
-        ref = ref_root / scen.stem
-        msgs = []
-        for f in ("trace.parquet", "message_trace.parquet"):
-            d = first_diff(pd.read_parquet(out.parent / f), pd.read_parquet(ref / f))
-            if d:
-                msgs.append(f"[{f}] {d}")
-        return scen.stem, "\n".join(msgs), dt
+        return scen.stem, diff_dir(out.parent, ref_root / scen.stem), dt
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--bin")
+    src.add_argument("--outputs", type=pathlib.Path, help="existing per-scenario output dirs")
     ap.add_argument("--ref", required=True, type=pathlib.Path)
     ap.add_argument("--only", default="")
     ap.add_argument("--jobs", type=int, default=6)
@@ -72,7 +81,11 @@ def main() -> int:
         scens = [p for p in scens if any(p.stem.startswith(o) for o in a.only.split(","))]
     bad = 0
     with cf.ThreadPoolExecutor(a.jobs) as ex:
-        for name, diff, dt in ex.map(lambda s: check(a.bin, s, a.ref), scens):
+        if a.outputs:
+            job = lambda s: (s.stem, diff_dir(a.outputs / s.stem, a.ref / s.stem), 0.0)
+        else:
+            job = lambda s: check(a.bin, s, a.ref)
+        for name, diff, dt in ex.map(job, scens):
             print(f"{'OK ' if not diff else 'BAD'} {name:34s} {dt:6.3f}s")
             if diff:
                 bad += 1
