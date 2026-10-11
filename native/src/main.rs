@@ -72,7 +72,7 @@ fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool, ledger: b
         for _ in 1..threads {
             sc.spawn(|| sim::work(&rx, &enc));
         }
-        s.run(tx, ledger);
+        s.run(tx, ledger, threads > 1);
         t_sim = t0.elapsed();
         sim::work(&rx, &enc);
     });

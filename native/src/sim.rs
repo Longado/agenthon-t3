@@ -626,7 +626,9 @@ struct QuoteEvent {
 // ---------------------------------------------------------------------------------------------
 // Kernel + world
 
-struct Latency {
+/// The scenario latency model: one draw per message between distinct agents, from its own
+/// RandomState, with parameters fixed for the run.
+struct LatencyModel {
     kind: LatencyKind,
     mean_ns: f64,
     min_ns: f64,
@@ -634,11 +636,8 @@ struct Latency {
     rs: RandomState,
 }
 
-impl Latency {
-    fn get(&mut self, sender: u32, recipient: u32) -> i64 {
-        if sender == recipient {
-            return 0;
-        }
+impl LatencyModel {
+    fn draw(&mut self) -> i64 {
         let value = match self.kind {
             LatencyKind::LogNormal { mu, sigma } => self.rs.lognormal(mu, sigma),
             LatencyKind::Uniform => self.rs.uniform(self.min_ns, self.max_ns),
@@ -652,6 +651,50 @@ impl Latency {
         let v = if self.min_ns > value { self.min_ns } else { value };
         let v = if self.max_ns < v { self.max_ns } else { v };
         py_round(v)
+    }
+}
+
+/// So the k-th draw never depends on the run, and `start_ahead` hands the model to a helper
+/// thread that computes draws in blocks while the kernel only reads them (the lognormal draw
+/// was the largest single cost of a message). Until then, or with no spare core, it draws inline.
+struct Latency {
+    model: Option<LatencyModel>,
+    ahead: Option<mpsc::Receiver<Vec<i64>>>,
+    buf: Vec<i64>,
+    pos: usize,
+}
+
+impl Latency {
+    fn start_ahead(&mut self) {
+        let Some(mut m) = self.model.take() else { return };
+        let (tx, rx) = mpsc::sync_channel(2);
+        std::thread::spawn(move || {
+            let mut n = 256; // small first block: the kernel waits for it
+            loop {
+                let block: Vec<i64> = (0..n).map(|_| m.draw()).collect();
+                if tx.send(block).is_err() {
+                    return; // the run is over
+                }
+                n = 4096;
+            }
+        });
+        self.ahead = Some(rx);
+    }
+
+    #[inline]
+    fn get(&mut self, sender: u32, recipient: u32) -> i64 {
+        if sender == recipient {
+            return 0;
+        }
+        if let Some(m) = self.model.as_mut() {
+            return m.draw();
+        }
+        if self.pos == self.buf.len() {
+            self.buf = self.ahead.as_ref().unwrap().recv().expect("latency thread stopped");
+            self.pos = 0;
+        }
+        self.pos += 1;
+        self.buf[self.pos - 1]
     }
 }
 
@@ -760,13 +803,14 @@ impl Sim {
             ms_value,
             jump: cfg.scheduled_jump.map(|(t, m)| (t, m, false)),
         };
-        let latency = Latency {
+        let model = LatencyModel {
             kind: cfg.latency.kind.clone(),
             mean_ns: cfg.latency.mean_ns,
             min_ns: cfg.latency.min_ns,
             max_ns: cfg.latency.max_ns,
             rs: latency_rs,
         };
+        let latency = Latency { model: Some(model), ahead: None, buf: Vec::new(), pos: 0 };
         let book = Book { last_trade: cfg.r_bar, ..Default::default() };
         Sim {
             current_time: cfg.date_ns,
@@ -956,9 +1000,13 @@ impl Sim {
     /// Runs the simulation. Trace segments and (with `ledger`) message_trace rows in PAGE-row
     /// blocks leave through `tx` as they become final, so encoders work alongside; the sender is
     /// dropped on return.
-    pub fn run(&mut self, tx: mpsc::Sender<Job>, ledger: bool) {
+    /// `latency_thread`: draw message latencies ahead on a helper thread (a spare core exists).
+    pub fn run(&mut self, tx: mpsc::Sender<Job>, ledger: bool, latency_thread: bool) {
         self.tx = Some(tx);
         self.ledger = ledger;
+        if latency_thread {
+            self.latency.start_ahead();
+        }
         self.run_kernel();
         self.flush_msgs();
         self.cut_trace(true);
