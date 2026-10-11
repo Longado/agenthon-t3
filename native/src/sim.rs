@@ -4,7 +4,6 @@
 //! `file:function` in comments where the ordering of side effects matters.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
@@ -450,59 +449,59 @@ fn crosses(order: &Order, level_price: i64) -> bool {
 // ---------------------------------------------------------------------------------------------
 // Agents
 
-/// Multiplicative hash for order-id keys; SipHash's flood resistance buys nothing here.
-#[derive(Default)]
-struct IdHasher(u64);
+/// `Sim::order_pos` entry for an order in no dict.
+const GONE: u32 = u32::MAX;
 
-impl std::hash::Hasher for IdHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("IdHasher only hashes i64 keys")
-    }
-    fn write_i64(&mut self, v: i64) {
-        self.0 = (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-}
-
-/// Insertion-ordered order dict (TradingAgent.orders).
+/// Insertion-ordered order dict (TradingAgent.orders). The index is shared by all traders:
+/// order ids are global and sequential, so `pos[id]` (Sim::order_pos) is where the order sits
+/// in its owner's `slots`, an array load instead of a hash lookup.
 #[derive(Default)]
 struct OrderDict {
     slots: Vec<Option<Order>>,
-    index: HashMap<i64, usize, std::hash::BuildHasherDefault<IdHasher>>,
     live: usize,
 }
 
 impl OrderDict {
-    fn insert(&mut self, o: Order) {
+    fn insert(&mut self, pos: &mut Vec<u32>, o: Order) {
         // Order ids are fresh on every placement, so this never overwrites.
-        self.index.insert(o.id, self.slots.len());
+        let id = o.id as usize;
+        if pos.len() <= id {
+            pos.resize(id + 1, GONE);
+        }
+        pos[id] = self.slots.len() as u32;
         self.slots.push(Some(o));
         self.live += 1;
         if self.slots.len() > 64 && self.live * 4 < self.slots.len() {
-            self.compact();
+            self.compact(pos);
         }
     }
-    fn get_mut(&mut self, id: i64) -> Option<&mut Order> {
-        let i = *self.index.get(&id)?;
+    /// Where order `id` sits here, if this dict holds it.
+    fn find(&self, pos: &[u32], id: i64) -> Option<usize> {
+        let i = *pos.get(usize::try_from(id).ok()?)? as usize;
+        match self.slots.get(i) {
+            Some(Some(o)) if o.id == id => Some(i),
+            _ => None,
+        }
+    }
+    fn get_mut(&mut self, pos: &[u32], id: i64) -> Option<&mut Order> {
+        let i = self.find(pos, id)?;
         self.slots[i].as_mut()
     }
-    fn remove(&mut self, id: i64) -> bool {
-        match self.index.remove(&id) {
+    fn remove(&mut self, pos: &mut [u32], id: i64) -> bool {
+        match self.find(pos, id) {
             Some(i) => {
                 self.slots[i] = None;
+                pos[id as usize] = GONE;
                 self.live -= 1;
                 true
             }
             None => false,
         }
     }
-    fn compact(&mut self) {
+    fn compact(&mut self, pos: &mut [u32]) {
         self.slots.retain(|s| s.is_some());
-        self.index.clear();
         for (i, s) in self.slots.iter().enumerate() {
-            self.index.insert(s.unwrap().id, i);
+            pos[s.unwrap().id as usize] = i as u32;
         }
     }
 }
@@ -695,6 +694,7 @@ pub struct Sim {
     order_events: Vec<OrderEvent>,
     quote_events: Vec<QuoteEvent>,
     last_exec: Vec<u32>, // order id -> log index of its last ORDER_EXECUTED event
+    order_pos: Vec<u32>, // order id -> place in its owner's OrderDict, or GONE
     // Events before `ev_base` (log index) went to the encoders as `segs_sent` trace segments.
     ev_base: usize,
     segs_sent: usize,
@@ -792,6 +792,7 @@ impl Sim {
             order_events: Vec::new(),
             quote_events: Vec::new(),
             last_exec: Vec::new(),
+            order_pos: Vec::new(),
             ev_base: 0,
             segs_sent: 0,
             last_event_t: i64::MIN,
@@ -1104,8 +1105,8 @@ impl Sim {
             Msg::MarketClosed => self.traders[i].mkt_closed = true,
             Msg::OrderExecuted(o) => {
                 self.log_order(t, K_EXECUTED, o);
-                let orders = &mut self.traders[i].orders;
-                let remove = match orders.get_mut(o.id) {
+                let (orders, pos) = (&mut self.traders[i].orders, &mut self.order_pos);
+                let remove = match orders.get_mut(pos, o.id) {
                     Some(mine) => {
                         if o.qty >= mine.qty {
                             true
@@ -1117,13 +1118,13 @@ impl Sim {
                     None => false,
                 };
                 if remove {
-                    orders.remove(o.id);
+                    orders.remove(pos, o.id);
                 }
             }
             Msg::OrderAccepted(o) => self.log_order(t, K_ACCEPTED, o),
             Msg::OrderCancelled(o) => {
                 self.log_order(t, K_CANCELLED, o);
-                self.traders[i].orders.remove(o.id);
+                self.traders[i].orders.remove(&mut self.order_pos, o.id);
             }
             Msg::QuerySpreadResponse { bid, ask, mkt_closed } => {
                 let tr = &mut self.traders[i];
@@ -1155,7 +1156,7 @@ impl Sim {
         let o = Order { id: self.next_order_id, agent, side, qty, limit, fill_price: None };
         self.next_order_id += 1;
         assert!(qty > 0, "non-positive order quantity");
-        self.traders[i].orders.insert(o);
+        self.traders[i].orders.insert(&mut self.order_pos, o);
         self.send(agent, 0, Msg::LimitOrder(o));
         let t = self.traders[i].current_time;
         self.log_order(t, K_SUBMITTED, o);
