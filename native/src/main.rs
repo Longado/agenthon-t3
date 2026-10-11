@@ -4,6 +4,7 @@
 // Shared by t3sim (page-level streaming writer) and outcheck (whole-column writer).
 #[allow(dead_code)]
 mod output;
+mod queue;
 mod rng;
 mod scenario;
 mod sim;

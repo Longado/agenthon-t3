@@ -4,13 +4,13 @@
 //! `file:function` in comments where the ordering of side effects matters.
 
 use std::cmp::Ordering;
-use std::collections::binary_heap::PeekMut;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 
 use crate::output::{self, Chunk, Col};
+use crate::queue::{Entry, Queue};
 use crate::rng::RandomState;
 use crate::scenario::{AgentKind, Config, LatencyKind};
 
@@ -168,53 +168,10 @@ impl Msg {
     }
 }
 
-/// Heap entry: Python orders `(deliver_at, (sender_id, recipient_id, message))`, and messages
-/// compare by message_id. `key` packs sender/recipient/message_id as 16/16/32 bits, so the order
-/// is one (i64, u64) comparison: scenario.rs refuses 2^16 or more agents, and message ids are
-/// checked against 2^32 when issued. `slot` points at the payload and its send-time ledger fields.
-#[derive(PartialEq, Eq, Clone, Copy)]
-struct Entry {
-    time: i64,
-    key: u64,
-    slot: u32,
-}
-
-impl Entry {
-    #[inline]
-    fn new(time: i64, sender: u32, recipient: u32, msg_id: i64, slot: u32) -> Self {
-        Entry { time, key: (sender as u64) << 48 | (recipient as u64) << 32 | msg_id as u64, slot }
-    }
-    #[inline]
-    fn sender(&self) -> u32 {
-        (self.key >> 48) as u32
-    }
-    #[inline]
-    fn recipient(&self) -> u32 {
-        (self.key >> 32) as u32 & 0xffff
-    }
-    #[inline]
-    fn msg_id(&self) -> i64 {
-        (self.key & 0xffff_ffff) as i64
-    }
-}
-
 /// `Sim::front` value for an agent with no requeued message; above every real key.
 const NO_FRONT: u64 = u64::MAX;
 /// Set in `Entry::slot` on an agent's front message (see run_kernel); slot numbers stay below it.
 const FRONT: u32 = 1 << 31;
-
-impl Ord for Entry {
-    #[inline]
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap: reverse for min-first.
-        (other.time, other.key).cmp(&(self.time, self.key))
-    }
-}
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
 
 const MSG_TYPES: [&str; 14] = [
     "WakeupMsg",
@@ -708,12 +665,12 @@ pub struct Sim {
     current_time: i64,
     agent_times: Vec<i64>,
     comp_delay: Vec<i64>,
-    heap: BinaryHeap<Entry>,
+    heap: Queue,
     /// Per agent: the key of its "front" message (the one of its requeued messages that stays in
-    /// `heap`, NO_FRONT if none) and the requeued messages parked behind it (time 0, so the
-    /// BinaryHeap orders them by key). See run_kernel.
+    /// `heap`, NO_FRONT if none) and the requeued messages parked behind it (time 0, so they
+    /// come out by key). See run_kernel.
     front: Vec<u64>,
-    parked: Vec<BinaryHeap<Entry>>,
+    parked: Vec<Queue>,
     slots: Vec<Msg>,
     slot_rows: Vec<SendRow>,
     free_slots: Vec<u32>,
@@ -815,9 +772,9 @@ impl Sim {
             current_time: cfg.date_ns,
             agent_times: vec![cfg.date_ns; n_agents],
             comp_delay: vec![50; n_agents],
-            heap: BinaryHeap::new(),
+            heap: Queue::default(),
             front: vec![NO_FRONT; n_agents],
-            parked: (0..n_agents).map(|_| BinaryHeap::new()).collect(),
+            parked: (0..n_agents).map(|_| Queue::default()).collect(),
             slots: Vec::new(),
             slot_rows: Vec::new(),
             free_slots: Vec::new(),
@@ -1014,8 +971,7 @@ impl Sim {
 
         // Kernel.runner
         while !self.heap.is_empty() && self.current_time != 0 && self.current_time <= self.cfg.stop_time {
-            let mut top = self.heap.peek_mut().unwrap();
-            let e = *top;
+            let e = self.heap.top();
             self.current_time = e.time;
             let r = e.recipient() as usize;
             let busy_until = self.agent_times[r];
@@ -1028,17 +984,16 @@ impl Sim {
                 // skipped requeues are pops at the time of a message just handled, so the stop
                 // test never fires on one: the handled order and the stop point are unchanged.
                 if e.key > self.front[r] {
-                    PeekMut::pop(top);
+                    self.heap.pop();
                     self.parked[r].push(Entry { time: 0, slot: e.slot & !FRONT, ..e });
                 } else {
                     // A lower key takes over; the old front stays queued, its flag now stale.
                     self.front[r] = e.key;
-                    top.time = busy_until; // pop + push in one sift
-                    top.slot |= FRONT;
+                    self.heap.requeue_top(busy_until, e.slot | FRONT); // pop + push in one sift
                 }
                 continue;
             }
-            PeekMut::pop(top);
+            self.heap.take_top(); // closed below, or filled by the handler's first push
             let was_front = e.slot & FRONT != 0 && e.key == self.front[r];
             let slot = e.slot & !FRONT;
             self.agent_times[r] = e.time;
@@ -1075,14 +1030,15 @@ impl Sim {
                 self.receive(e.recipient(), e.time, e.sender(), msg);
             }
             if was_front {
-                self.front[r] = match self.parked[r].pop() {
-                    Some(p) => {
-                        self.heap.push(Entry { time: self.agent_times[r], slot: p.slot | FRONT, ..p });
-                        p.key
-                    }
-                    None => NO_FRONT,
+                self.front[r] = if self.parked[r].is_empty() {
+                    NO_FRONT
+                } else {
+                    let p = self.parked[r].pop();
+                    self.heap.push(Entry { time: self.agent_times[r], slot: p.slot | FRONT, ..p });
+                    p.key
                 };
             }
+            self.heap.close();
         }
     }
 
