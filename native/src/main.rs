@@ -1,6 +1,8 @@
 //! `simulate` / `simulate-batch` for the Track 3 image. Runs the native engine when the scenario
 //! is fully supported; otherwise replaces itself with the Python ABIDES baseline (same arguments).
 
+// Shared by t3sim (page-level streaming writer) and outcheck (whole-column writer).
+#[allow(dead_code)]
 mod output;
 mod rng;
 mod scenario;
@@ -9,6 +11,8 @@ mod sim;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
 use serde_json::{json, Value};
@@ -57,11 +61,22 @@ fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::i
     let t0 = Instant::now();
     let scenario_id = p.cfg.scenario_id.clone();
     let mut s = sim::Sim::new(p.cfg);
-    s.run();
+    // message_trace pages are encoded by `threads - 1` helpers while the simulation runs; the
+    // main thread drains whatever is left once it finishes.
+    let (tx, rx) = mpsc::channel();
+    let (rx, pages, rows) = (Mutex::new(rx), Mutex::new(Vec::new()), AtomicUsize::new(0));
+    std::thread::scope(|sc| {
+        for _ in 1..threads {
+            sc.spawn(|| sim::MessagePages::work(&rx, &pages, &rows));
+        }
+        s.run(tx);
+        sim::MessagePages::work(&rx, &pages, &rows);
+    });
+    let msg_pages = sim::MessagePages::finish(pages, rows);
     let t_run = t0.elapsed();
     let dir = trace_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
-    let w = s.write_outputs(trace_path, &dir.join("message_trace.parquet"), threads)?;
+    let w = s.write_outputs(msg_pages, trace_path, &dir.join("message_trace.parquet"), threads)?;
     if std::env::var_os("T3SIM_TIMING").is_some() {
         eprintln!("t3sim timing: run {:?} write {:?} (threads {threads})", t_run, t0.elapsed() - t_run);
     }

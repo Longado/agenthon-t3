@@ -9,7 +9,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Mutex};
 
 use crate::output::{self, Chunk, Col};
 use crate::rng::RandomState;
@@ -102,10 +102,11 @@ pub enum Side {
 }
 
 impl Side {
-    fn name(self) -> &'static str {
+    /// Index into SIDES (the trace's side strings).
+    fn idx(self) -> u32 {
         match self {
-            Side::Bid => "BID",
-            Side::Ask => "ASK",
+            Side::Bid => 0,
+            Side::Ask => 1,
         }
     }
 }
@@ -244,7 +245,7 @@ struct SendRow {
 const WAKE_SEND: SendRow = SendRow { t_send: NONE, t_recv: NONE, order_id: NONE, causal: NONE, msg_type: 0 };
 
 /// One message_trace row, appended at delivery (so the log is already in `seq` order).
-struct MsgRow {
+pub struct MsgRow {
     message_id: i64,
     t_send: i64,
     t_recv: i64,
@@ -263,6 +264,12 @@ struct TracePrep {
 }
 
 const QUOTE: u32 = 1 << 31;
+
+/// A completed run of message_trace rows: (block index, rows); block b holds rows b*PAGE...
+pub struct MsgBlock(usize, Vec<MsgRow>);
+
+const TRACE_TYPES: [&str; 6] = ["QUOTE_UPDATE", "ORDER_SUBMITTED", "ORDER_ACCEPTED", "ORDER_CANCELLED", "ORDER_FILLED", "PARTIAL_FILL"];
+const SIDES: [&str; 2] = ["BID", "ASK"];
 
 fn opt(v: i64) -> Option<i64> {
     if v == NONE { None } else { Some(v) }
@@ -527,7 +534,11 @@ pub struct Sim {
     next_msg_id: i64,
     next_order_id: i64,
     causal: Option<i64>,
+    // message_trace rows, PAGE at a time: the open block, the number already handed off, and
+    // where completed blocks go (an encoder pool while running; see Sim::run).
     msgs: Vec<MsgRow>,
+    msg_blocks: usize,
+    msg_tx: Option<mpsc::Sender<MsgBlock>>,
     // exchange (agent 0)
     ex_time: i64,
     book: Book,
@@ -615,7 +626,9 @@ impl Sim {
             next_msg_id: 1,
             next_order_id: 0,
             causal: None,
-            msgs: Vec::new(),
+            msgs: Vec::with_capacity(output::PAGE),
+            msg_blocks: 0,
+            msg_tx: None,
             ex_time: 0,
             book,
             close_price_subs: Vec::new(),
@@ -691,7 +704,34 @@ impl Sim {
         self.heap.push(Entry::new(t, agent, agent, id, slot));
     }
 
-    pub fn run(&mut self) {
+    fn push_msg(&mut self, row: MsgRow) {
+        self.msgs.push(row);
+        if self.msgs.len() == output::PAGE {
+            self.flush_msgs();
+        }
+    }
+
+    fn flush_msgs(&mut self) {
+        if self.msgs.is_empty() {
+            return;
+        }
+        let block = std::mem::replace(&mut self.msgs, Vec::with_capacity(output::PAGE));
+        let tx = self.msg_tx.as_ref().expect("message sink");
+        // The receiving side lives until run() returns (MessagePages::collect drains it).
+        tx.send(MsgBlock(self.msg_blocks, block)).expect("message pages receiver alive");
+        self.msg_blocks += 1;
+    }
+
+    /// Runs the simulation. message_trace rows leave in PAGE-row blocks through `msg_tx` as they
+    /// are delivered, so encoders can work alongside; the sender is dropped on return.
+    pub fn run(&mut self, msg_tx: mpsc::Sender<MsgBlock>) {
+        self.msg_tx = Some(msg_tx);
+        self.run_kernel();
+        self.flush_msgs();
+        self.msg_tx = None;
+    }
+
+    fn run_kernel(&mut self) {
         // Kernel.initialize: kernel_initializing for all, then kernel_starting for all.
         self.set_wakeup(0, self.cfg.mkt_close); // ExchangeAgent.kernel_initializing
         let start = self.cfg.date_ns;
@@ -717,7 +757,7 @@ impl Sim {
             self.free_slots.push(e.slot);
             if let Msg::Wakeup = msg {
                 self.causal = Some(e.msg_id());
-                self.msgs.push(MsgRow {
+                self.push_msg(MsgRow {
                     message_id: e.msg_id(),
                     t_send: NONE,
                     t_recv: e.time,
@@ -733,7 +773,7 @@ impl Sim {
                 self.agent_times[r] += self.comp_delay[r];
                 self.causal = Some(e.msg_id());
                 let w = self.slot_rows[e.slot as usize];
-                self.msgs.push(MsgRow {
+                self.push_msg(MsgRow {
                     message_id: e.msg_id(),
                     t_send: w.t_send,
                     t_recv: w.t_recv,
@@ -1115,55 +1155,57 @@ impl Sim {
 
     // --- outputs -----------------------------------------------------------------------------
 
-    /// abides_fork/trace.py:extract_trace and extract_message_trace, written straight from the
-    /// event logs. All (row group, column) chunks of both files are jobs in one pool on `threads`
-    /// workers: message jobs start at once, trace jobs once the main thread has ordered the rows.
-    pub fn write_outputs(&self, trace_path: &Path, msg_path: &Path, threads: usize) -> io::Result<Written> {
-        let n_msgs = self.msgs.len();
-        let m_jobs = output::n_jobs(n_msgs, 10);
-        let m_out: Vec<Mutex<Option<Chunk>>> = (0..m_jobs).map(|_| Mutex::new(None)).collect();
-        let trace: OnceLock<(TracePrep, Vec<Mutex<Option<Chunk>>>)> = OnceLock::new();
-        let next = AtomicUsize::new(0);
-        let work = || {
+    /// abides_fork/trace.py:extract_trace and extract_message_trace. Message pages were encoded
+    /// during the run (`msg_pages`); here the message file is assembled on one thread while the
+    /// trace rows are ordered and their pages encoded on the rest of the `threads` budget.
+    pub fn write_outputs(&self, msg_pages: MessagePages, trace_path: &Path, msg_path: &Path, threads: usize) -> io::Result<Written> {
+        let n_msgs = msg_pages.rows;
+        let write_msgs = move || {
             let mut sc = output::new_scratch();
-            self.with_msg_cols(|mc| loop {
-                let j = next.fetch_add(1, Relaxed);
-                if j < m_jobs {
-                    *m_out[j].lock().unwrap() = Some(output::encode_job(mc, n_msgs, j, &mut sc));
-                    continue;
-                }
-                let (prep, t_out) = trace.wait();
-                if j - m_jobs >= t_out.len() {
-                    break;
-                }
-                let c = self.with_trace_cols(prep, |tc| output::encode_job(tc, prep.rows.len(), j - m_jobs, &mut sc));
-                *t_out[j - m_jobs].lock().unwrap() = Some(c);
-            })
+            msg_cols(&[], 0, |cols| output::assemble_message_pages(msg_path, n_msgs, cols, msg_pages.by_column(), &mut sc))
         };
-        std::thread::scope(|sc| {
-            for _ in 1..threads.max(1) {
-                sc.spawn(work);
-            }
+        let write_trace = |helpers: usize| -> io::Result<(usize, String)> {
             let prep = self.trace_prep();
-            let t_out = (0..output::n_jobs(prep.rows.len(), 7)).map(|_| Mutex::new(None)).collect();
-            let _ = trace.set((prep, t_out));
-            work();
-        });
-        let take = |v: Vec<Mutex<Option<Chunk>>>| -> Vec<Chunk> {
-            v.into_iter().map(|m| m.into_inner().unwrap().expect("encoded chunk")).collect()
+            let n = prep.rows.len();
+            let pages = n.div_ceil(output::PAGE);
+            let jobs = pages * 7;
+            let out: Vec<Mutex<Option<Chunk>>> = (0..jobs).map(|_| Mutex::new(None)).collect();
+            let next = AtomicUsize::new(0);
+            let work = || {
+                let mut sc = output::new_scratch();
+                self.with_trace_cols(&prep, |cols| loop {
+                    let j = next.fetch_add(1, Relaxed);
+                    if j >= jobs {
+                        break;
+                    }
+                    let (c, pg) = (j / pages, j % pages);
+                    let page = output::encode_page(&cols[c], pg * output::PAGE, ((pg + 1) * output::PAGE).min(n), &mut sc);
+                    *out[j].lock().unwrap() = Some(page);
+                })
+            };
+            std::thread::scope(|sc| {
+                for _ in 0..helpers {
+                    sc.spawn(work);
+                }
+                work();
+            });
+            let mut it = out.into_iter().map(|m| m.into_inner().unwrap().expect("encoded page"));
+            let by_col: Vec<Vec<Chunk>> = (0..7).map(|_| it.by_ref().take(pages).collect()).collect();
+            let mut sc = output::new_scratch();
+            let sha = self.with_trace_cols(&prep, |cols| output::assemble_trace_pages(trace_path, n, cols, by_col, &mut sc))?;
+            Ok((n, sha))
         };
-        let (prep, t_out) = trace.into_inner().expect("trace prepared");
-        let n_events = prep.rows.len();
-        let (m_chunks, t_chunks) = (take(m_out), take(t_out));
         let (t, m) = if threads >= 2 {
             std::thread::scope(|sc| {
-                let h = sc.spawn(|| output::assemble_messages(msg_path, n_msgs, m_chunks));
-                (output::assemble_trace(trace_path, n_events, t_chunks), h.join().expect("assembler panicked"))
+                let h = sc.spawn(write_msgs);
+                let t = write_trace(threads.saturating_sub(2));
+                (t, h.join().expect("message writer panicked"))
             })
         } else {
-            (output::assemble_trace(trace_path, n_events, t_chunks), output::assemble_messages(msg_path, n_msgs, m_chunks))
+            (write_trace(0), write_msgs())
         };
-        Ok(Written { n_events: n_events as u64, trace_sha: t?, n_messages: n_msgs as u64, message_sha: m? })
+        let (n_events, trace_sha) = t?;
+        Ok(Written { n_events: n_events as u64, trace_sha, n_messages: n_msgs as u64, message_sha: m? })
     }
 
     /// Row order of trace.parquet: order events sorted by (t_ns, order_id) with ties in log order,
@@ -1241,20 +1283,21 @@ impl Sim {
         let at = |i: usize| p.rows[i];
         let t_ns = |i| { let r = at(i); if r & QUOTE != 0 { q(r).0 } else { e(r).t } };
         let agent = |i| { let r = at(i); if r & QUOTE != 0 { 0 } else { e(r).o.agent as i32 } };
+        // Indices into TRACE_TYPES / SIDES.
         let msg_type = |i| {
             let r = at(i);
             if r & QUOTE != 0 {
-                return "QUOTE_UPDATE";
+                return 0;
             }
             match e(r).kind {
-                K_SUBMITTED => "ORDER_SUBMITTED",
-                K_ACCEPTED => "ORDER_ACCEPTED",
-                K_CANCELLED => "ORDER_CANCELLED",
-                _ if p.last_exec[e(r).o.id as usize] == r => "ORDER_FILLED",
-                _ => "PARTIAL_FILL",
+                K_SUBMITTED => 1,
+                K_ACCEPTED => 2,
+                K_CANCELLED => 3,
+                _ if p.last_exec[e(r).o.id as usize] == r => 4,
+                _ => 5,
             }
         };
-        let side = |i| { let r = at(i); Some(if r & QUOTE != 0 { q(r).1 } else { e(r).o.side }.name()) };
+        let side = |i| { let r = at(i); if r & QUOTE != 0 { q(r).1 } else { e(r).o.side }.idx() };
         let price = |i| {
             let r = at(i);
             if r & QUOTE != 0 {
@@ -1265,33 +1308,76 @@ impl Sim {
         };
         let size = |i| { let r = at(i); if r & QUOTE != 0 { q(r).3 } else { e(r).o.qty } };
         let order_id = |i| { let r = at(i); if r & QUOTE != 0 { -1 } else { e(r).o.id } };
-        f(&[Col::I64(&t_ns), Col::I32(&agent), Col::Str(&msg_type), Col::OptStr(&side), Col::I64(&price), Col::I64(&size), Col::I64(&order_id)])
+        f(&[Col::I64(&t_ns), Col::I32(&agent), Col::Dict(&TRACE_TYPES, &msg_type), Col::Dict(&SIDES, &side), Col::I64(&price), Col::I64(&size), Col::I64(&order_id)])
+    }
+}
+
+/// The 10 message_trace.parquet columns (schema order) over `block`, whose row 0 is `seq` `base`.
+fn msg_cols<R>(block: &[MsgRow], base: usize, f: impl FnOnce(&[Col; 10]) -> R) -> R {
+    let row = |i: usize| &block[i];
+    let seq = |i: usize| (base + i) as i64;
+    let t_recv = |i| row(i).t_recv;
+    let t_send = |i| opt(row(i).t_send);
+    let latency = |i| { let r = row(i); if r.t_send == NONE { 0 } else { r.t_recv - r.t_send } };
+    let src = |i| row(i).src as i32;
+    let dst = |i| row(i).dst as i32;
+    let message_id = |i| row(i).message_id;
+    let msg_type = |i| row(i).msg_type as u32;
+    let order_id = |i| opt(row(i).order_id);
+    let causal = |i| opt(row(i).causal);
+    f(&[
+        Col::I64(&seq),
+        Col::I64(&t_recv),
+        Col::OptI64(&t_send),
+        Col::I64(&latency),
+        Col::I32(&src),
+        Col::I32(&dst),
+        Col::I64(&message_id),
+        Col::Dict(&MSG_TYPES, &msg_type),
+        Col::OptI64(&order_id),
+        Col::OptI64(&causal),
+    ])
+}
+
+/// Encoded message_trace pages, collected from the blocks `Sim::run` sends.
+pub struct MessagePages {
+    blocks: Mutex<Vec<Option<Vec<Chunk>>>>,
+    rows: usize,
+}
+
+impl MessagePages {
+    /// Encodes blocks from `rx` until every sender is gone. Any number of threads may call this
+    /// on the same receiver concurrently; `finish` then yields the pages.
+    pub fn work(rx: &Mutex<mpsc::Receiver<MsgBlock>>, into: &Mutex<Vec<Option<Vec<Chunk>>>>, rows: &AtomicUsize) {
+        let mut sc = output::new_scratch();
+        loop {
+            let next = rx.lock().unwrap().recv();
+            let Ok(MsgBlock(b, block)) = next else { break };
+            let pages = msg_cols(&block, b * output::PAGE, |cols| {
+                cols.iter().map(|c| output::encode_page(c, 0, block.len(), &mut sc)).collect::<Vec<_>>()
+            });
+            rows.fetch_add(block.len(), Relaxed);
+            let mut v = into.lock().unwrap();
+            if v.len() <= b {
+                v.resize_with(b + 1, || None);
+            }
+            v[b] = Some(pages);
+        }
     }
 
-    /// The 10 message_trace.parquet columns (schema order) as row accessors over the delivery log.
-    fn with_msg_cols<R>(&self, f: impl FnOnce(&[Col; 10]) -> R) -> R {
-        let row = |i: usize| &self.msgs[i];
-        let seq = |i: usize| i as i64;
-        let t_recv = |i| row(i).t_recv;
-        let t_send = |i| opt(row(i).t_send);
-        let latency = |i| { let r = row(i); if r.t_send == NONE { 0 } else { r.t_recv - r.t_send } };
-        let src = |i| row(i).src as i32;
-        let dst = |i| row(i).dst as i32;
-        let message_id = |i| row(i).message_id;
-        let msg_type = |i| MSG_TYPES[row(i).msg_type as usize];
-        let order_id = |i| opt(row(i).order_id);
-        let causal = |i| opt(row(i).causal);
-        f(&[
-            Col::I64(&seq),
-            Col::I64(&t_recv),
-            Col::OptI64(&t_send),
-            Col::I64(&latency),
-            Col::I32(&src),
-            Col::I32(&dst),
-            Col::I64(&message_id),
-            Col::Str(&msg_type),
-            Col::OptI64(&order_id),
-            Col::OptI64(&causal),
-        ])
+    pub fn finish(into: Mutex<Vec<Option<Vec<Chunk>>>>, rows: AtomicUsize) -> MessagePages {
+        MessagePages { blocks: into, rows: rows.into_inner() }
+    }
+
+    /// [column][page], every block present.
+    fn by_column(self) -> Vec<Vec<Chunk>> {
+        let blocks = self.blocks.into_inner().unwrap();
+        let mut cols: Vec<Vec<Chunk>> = (0..10).map(|_| Vec::with_capacity(blocks.len())).collect();
+        for b in blocks {
+            for (c, page) in b.expect("message block encoded").into_iter().enumerate() {
+                cols[c].push(page);
+            }
+        }
+        cols
     }
 }

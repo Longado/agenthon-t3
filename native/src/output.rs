@@ -32,7 +32,6 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use sha2::{Digest, Sha256};
 
-#[allow(dead_code)] // materialized columns: used by src/bin/outcheck.rs
 pub struct TraceCols {
     pub t_ns: Vec<i64>,
     pub agent_id: Vec<i32>,
@@ -43,7 +42,6 @@ pub struct TraceCols {
     pub order_id: Vec<i64>,
 }
 
-#[allow(dead_code)]
 pub struct MsgCols {
     pub seq: Vec<i64>,
     pub t_recv_ns: Vec<i64>,
@@ -92,12 +90,16 @@ const MSG_PANDAS: &str = r#"{"index_columns": [], "column_indexes": [], "columns
 const MSG_ARROW: &str = "/////6AHAAAQAAAAAAAKAA4ABgAFAAgACgAAAAABBAAQAAAAAAAKAAwAAAAEAAgACgAAADQFAAAEAAAAAQAAAAwAAAAIAAwABAAIAAgAAAAIAAAAEAAAAAYAAABwYW5kYXMAAPwEAAB7ImluZGV4X2NvbHVtbnMiOiBbXSwgImNvbHVtbl9pbmRleGVzIjogW10sICJjb2x1bW5zIjogW3sibmFtZSI6ICJzZXEiLCAiZmllbGRfbmFtZSI6ICJzZXEiLCAicGFuZGFzX3R5cGUiOiAiaW50NjQiLCAibnVtcHlfdHlwZSI6ICJpbnQ2NCIsICJtZXRhZGF0YSI6IG51bGx9LCB7Im5hbWUiOiAidF9yZWN2X25zIiwgImZpZWxkX25hbWUiOiAidF9yZWN2X25zIiwgInBhbmRhc190eXBlIjogImludDY0IiwgIm51bXB5X3R5cGUiOiAiaW50NjQiLCAibWV0YWRhdGEiOiBudWxsfSwgeyJuYW1lIjogInRfc2VuZF9ucyIsICJmaWVsZF9uYW1lIjogInRfc2VuZF9ucyIsICJwYW5kYXNfdHlwZSI6ICJpbnQ2NCIsICJudW1weV90eXBlIjogIkludDY0IiwgIm1ldGFkYXRhIjogbnVsbH0sIHsibmFtZSI6ICJsYXRlbmN5X25zIiwgImZpZWxkX25hbWUiOiAibGF0ZW5jeV9ucyIsICJwYW5kYXNfdHlwZSI6ICJpbnQ2NCIsICJudW1weV90eXBlIjogImludDY0IiwgIm1ldGFkYXRhIjogbnVsbH0sIHsibmFtZSI6ICJzcmNfaWQiLCAiZmllbGRfbmFtZSI6ICJzcmNfaWQiLCAicGFuZGFzX3R5cGUiOiAiaW50MzIiLCAibnVtcHlfdHlwZSI6ICJpbnQzMiIsICJtZXRhZGF0YSI6IG51bGx9LCB7Im5hbWUiOiAiZHN0X2lkIiwgImZpZWxkX25hbWUiOiAiZHN0X2lkIiwgInBhbmRhc190eXBlIjogImludDMyIiwgIm51bXB5X3R5cGUiOiAiaW50MzIiLCAibWV0YWRhdGEiOiBudWxsfSwgeyJuYW1lIjogIm1lc3NhZ2VfaWQiLCAiZmllbGRfbmFtZSI6ICJtZXNzYWdlX2lkIiwgInBhbmRhc190eXBlIjogImludDY0IiwgIm51bXB5X3R5cGUiOiAiaW50NjQiLCAibWV0YWRhdGEiOiBudWxsfSwgeyJuYW1lIjogIm1zZ190eXBlIiwgImZpZWxkX25hbWUiOiAibXNnX3R5cGUiLCAicGFuZGFzX3R5cGUiOiAidW5pY29kZSIsICJudW1weV90eXBlIjogInN0cmluZyIsICJtZXRhZGF0YSI6IG51bGx9LCB7Im5hbWUiOiAib3JkZXJfaWQiLCAiZmllbGRfbmFtZSI6ICJvcmRlcl9pZCIsICJwYW5kYXNfdHlwZSI6ICJpbnQ2NCIsICJudW1weV90eXBlIjogIkludDY0IiwgIm1ldGFkYXRhIjogbnVsbH0sIHsibmFtZSI6ICJjYXVzYWxfcGFyZW50IiwgImZpZWxkX25hbWUiOiAiY2F1c2FsX3BhcmVudCIsICJwYW5kYXNfdHlwZSI6ICJpbnQ2NCIsICJudW1weV90eXBlIjogIkludDY0IiwgIm1ldGFkYXRhIjogbnVsbH1dLCAiY3JlYXRvciI6IHsibGlicmFyeSI6ICJweWFycm93IiwgInZlcnNpb24iOiAiMTUuMC4yIn0sICJwYW5kYXNfdmVyc2lvbiI6ICIxLjUuMyJ9AAAAAAoAAAAEAgAAvAEAAIQBAABMAQAAGAEAAOQAAACsAAAAeAAAAEAAAAAEAAAANP7//wAAAQIQAAAAIAAAAAQAAAAAAAAADQAAAGNhdXNhbF9wYXJlbnQAAAAw/v//AAAAAUAAAABs/v//AAABAhAAAAAcAAAABAAAAAAAAAAIAAAAb3JkZXJfaWQAAAAAZP7//wAAAAFAAAAAoP7//wAAAQUQAAAAIAAAAAQAAAAAAAAACAAAAG1zZ190eXBlAAAAAAQABAAEAAAA0P7//wAAAQIQAAAAHAAAAAQAAAAAAAAACgAAAG1lc3NhZ2VfaWQAAMj+//8AAAABQAAAAAT///8AAAECEAAAABgAAAAEAAAAAAAAAAYAAABkc3RfaWQAAPj+//8AAAABIAAAADT///8AAAECEAAAABgAAAAEAAAAAAAAAAYAAABzcmNfaWQAACj///8AAAABIAAAAGT///8AAAECEAAAABwAAAAEAAAAAAAAAAoAAABsYXRlbmN5X25zAABc////AAAAAUAAAACY////AAABAhAAAAAcAAAABAAAAAAAAAAJAAAAdF9zZW5kX25zAAAAkP///wAAAAFAAAAAzP///wAAAQIQAAAAHAAAAAQAAAAAAAAACQAAAHRfcmVjdl9ucwAAAMT///8AAAABQAAAABAAFAAIAAYABwAMAAAAEAAQAAAAAAABAhAAAAAcAAAABAAAAAAAAAADAAAAc2VxAAgADAAIAAcACAAAAAAAAAFAAAAAAAAAAA==";
 
 /// One output column as a row accessor: `f(i)` is the value of row `i`.
+/// `Dict` columns take values from a fixed table (`f` returns the table index): every
+/// page then encodes on its own, so pages can be produced while the simulation still runs.
+/// `Str`/`OptStr` build a first-appearance dictionary per column chunk (whole-chunk encoding only).
 pub enum Col<'a> {
     I64(&'a (dyn Fn(usize) -> i64 + Sync)),
     I32(&'a (dyn Fn(usize) -> i32 + Sync)),
     OptI64(&'a (dyn Fn(usize) -> Option<i64> + Sync)),
     Str(&'a (dyn Fn(usize) -> &'static str + Sync)),
     OptStr(&'a (dyn Fn(usize) -> Option<&'static str> + Sync)),
+    Dict(&'static [&'static str], &'a (dyn Fn(usize) -> u32 + Sync)),
 }
 
 fn err<E: std::fmt::Display>(e: E) -> io::Error {
@@ -156,6 +158,17 @@ pub struct Scratch {
 impl Chunk {
     fn new() -> Self {
         Chunk { buf: Vec::new(), uncompressed: 0, first_data: None, dict: false, num_values: 0 }
+    }
+
+    /// Appends `next`'s pages after this chunk's.
+    fn append(&mut self, next: &Chunk) {
+        if self.first_data.is_none() {
+            self.first_data = next.first_data.map(|o| o + self.buf.len());
+        }
+        self.buf.extend_from_slice(&next.buf);
+        self.uncompressed += next.uncompressed;
+        self.dict |= next.dict;
+        self.num_values += next.num_values;
     }
 
     /// Appends one snappy-compressed page (header + body).
@@ -375,8 +388,101 @@ fn encode_col(col: &Col, start: usize, end: usize, sc: &mut Scratch) -> Chunk {
             let o: Vec<Option<&'static str>> = (start..end).map(|i| f(i)).collect();
             encode_str_chunk(&mut c, sc, &o, false);
         }
+        Col::Dict(t, _) => {
+            c = dict_chunk(t, sc);
+            let mut s = start;
+            while s < end {
+                let e = (s + PAGE_ROWS).min(end);
+                c.append(&encode_page(col, s, e, sc));
+                s = e;
+            }
+        }
     }
     c
+}
+
+/// Rows per data page; a page-level producer must cut pages at multiples of this.
+pub const PAGE: usize = PAGE_ROWS;
+
+/// The dictionary page of a fixed-table column (PLAIN entries).
+fn dict_chunk(table: &[&'static str], sc: &mut Scratch) -> Chunk {
+    let mut c = Chunk::new();
+    let mut body = Vec::new();
+    for s in table {
+        body.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        body.extend_from_slice(s.as_bytes());
+    }
+    c.page(sc, PAGE_DICT, table.len(), ENC_PLAIN, &body);
+    c
+}
+
+/// One data page of rows `start..end` (at most PAGE rows) as a chunk fragment.
+/// Supports the page-independent column kinds (ints and fixed-table strings).
+pub fn encode_page(col: &Col, start: usize, end: usize, sc: &mut Scratch) -> Chunk {
+    debug_assert!(end - start <= PAGE_ROWS);
+    let mut c = Chunk::new();
+    let n = end - start;
+    match col {
+        Col::I64(_) | Col::I32(_) | Col::OptI64(_) => {
+            // A single page: encode_col's page loop runs once.
+            return encode_col(col, start, end, sc);
+        }
+        Col::Dict(t, f) => {
+            let ids: Vec<u32> = (start..end).map(|i| f(i)).collect();
+            dict_data_page(&mut c, sc, t.len(), n, &ids);
+        }
+        Col::Str(_) | Col::OptStr(_) => panic!("first-appearance dictionaries are chunk-level only"),
+    }
+    c
+}
+
+/// RLE_DICTIONARY data page (all rows present) over a dictionary of `dict_len` entries.
+fn dict_data_page(c: &mut Chunk, sc: &mut Scratch, dict_len: usize, rows: usize, ids: &[u32]) {
+    let width = (32 - (dict_len.max(2) as u32 - 1).leading_zeros()).max(1);
+    let mut body = Vec::with_capacity(16 + ids.len());
+    def_levels(&mut body, rows, None);
+    body.push(width as u8);
+    uleb(&mut body, ((ids.len().div_ceil(8)) as u64) << 1 | 1);
+    bitpack(&mut body, ids.iter().map(|x| *x as u64), width);
+    c.page(sc, PAGE_DATA, rows, ENC_RLE_DICT, &body);
+}
+
+/// Assembles a file from per-column page fragments (`pages[col][page]`, PAGE rows each but the
+/// last); `cols` supplies each column's kind (for dictionary pages). Returns the SHA-256.
+fn assemble_pages(
+    path: &Path,
+    schema: &str,
+    pandas_json: &str,
+    arrow_schema_b64: &str,
+    n: usize,
+    cols: &[Col],
+    pages: Vec<Vec<Chunk>>,
+    sc: &mut Scratch,
+) -> io::Result<String> {
+    let per_rg = ROW_GROUP / PAGE_ROWS;
+    let mut chunks = Vec::with_capacity(n.div_ceil(ROW_GROUP) * cols.len());
+    for rg in 0..n.div_ceil(ROW_GROUP) {
+        for (c, col) in cols.iter().enumerate() {
+            let mut chunk = match col {
+                Col::Dict(t, _) => dict_chunk(t, sc),
+                _ => Chunk::new(),
+            };
+            let hi = ((rg + 1) * per_rg).min(pages[c].len());
+            for pg in &pages[c][rg * per_rg..hi] {
+                chunk.append(pg);
+            }
+            chunks.push(chunk);
+        }
+    }
+    assemble(path, schema, pandas_json, arrow_schema_b64, n, chunks)
+}
+
+pub fn assemble_trace_pages(path: &Path, n: usize, cols: &[Col; 7], pages: Vec<Vec<Chunk>>, sc: &mut Scratch) -> io::Result<String> {
+    assemble_pages(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, n, cols, pages, sc)
+}
+
+pub fn assemble_message_pages(path: &Path, n: usize, cols: &[Col; 10], pages: Vec<Vec<Chunk>>, sc: &mut Scratch) -> io::Result<String> {
+    assemble_pages(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, n, cols, pages, sc)
 }
 
 pub fn new_scratch() -> Scratch {
@@ -501,18 +607,6 @@ fn hex(d: &[u8]) -> String {
     d.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// trace.parquet from chunks encoded with `encode_job` over the 7 trace columns.
-#[allow(dead_code)] // t3sim only; outcheck includes this module too
-pub fn assemble_trace(path: &Path, n: usize, chunks: Vec<Chunk>) -> io::Result<String> {
-    assemble(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, n, chunks)
-}
-
-/// message_trace.parquet from chunks encoded with `encode_job` over the 10 message columns.
-#[allow(dead_code)]
-pub fn assemble_messages(path: &Path, n: usize, chunks: Vec<Chunk>) -> io::Result<String> {
-    assemble(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, n, chunks)
-}
-
 /// trace.parquet; `cols` in schema order: t_ns, agent_id, msg_type, side, price, size, order_id.
 pub fn write_trace_cols(path: &Path, n: usize, cols: &[Col; 7], threads: usize) -> io::Result<String> {
     write_file(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, n, cols, threads)
@@ -524,7 +618,6 @@ pub fn write_message_cols(path: &Path, n: usize, cols: &[Col; 10], threads: usiz
     write_file(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, n, cols, threads)
 }
 
-#[allow(dead_code)]
 pub fn write_trace(path: &Path, t: &TraceCols) -> io::Result<()> {
     write_trace_cols(
         path,
@@ -543,7 +636,6 @@ pub fn write_trace(path: &Path, t: &TraceCols) -> io::Result<()> {
     .map(|_| ())
 }
 
-#[allow(dead_code)]
 pub fn write_message_trace(path: &Path, m: &MsgCols) -> io::Result<()> {
     write_message_cols(
         path,
@@ -565,7 +657,6 @@ pub fn write_message_trace(path: &Path, m: &MsgCols) -> io::Result<()> {
     .map(|_| ())
 }
 
-#[allow(dead_code)]
 pub fn sha256_file(path: &Path) -> io::Result<String> {
     let mut f = File::open(path)?;
     let mut h = Sha256::new();

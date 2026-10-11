@@ -6,6 +6,8 @@
 //   u8 kind ('T' trace | 'M' message_trace), u64 nrows, u64 dict_len, dict JSON {"msg_type":[..],"side":[..]},
 //   then columns in file order. Ints: raw LE. Strings: u16 LE codes into dict (65535 = null).
 //   Nullable ints (t_send_ns, order_id, causal_parent): i64 values then u8 mask (1 = null).
+// Shared by t3sim (page-level streaming writer) and outcheck (whole-column writer).
+#[allow(dead_code)]
 #[path = "../output.rs"]
 mod output;
 
