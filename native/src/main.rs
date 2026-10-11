@@ -66,11 +66,13 @@ fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::i
     // main thread drains whatever is left once it finishes.
     let (tx, rx) = mpsc::channel();
     let (rx, pages, rows) = (Mutex::new(rx), Mutex::new(Vec::new()), AtomicUsize::new(0));
+    let mut t_sim = Default::default();
     std::thread::scope(|sc| {
         for _ in 1..threads {
             sc.spawn(|| sim::MessagePages::work(&rx, &pages, &rows));
         }
         s.run(tx);
+        t_sim = t0.elapsed();
         sim::MessagePages::work(&rx, &pages, &rows);
     });
     if s.disordered() {
@@ -82,7 +84,7 @@ fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool) -> std::i
     std::fs::create_dir_all(&dir)?;
     let w = s.write_outputs(msg_pages, trace_path, &dir.join("message_trace.parquet"), threads)?;
     if std::env::var_os("T3SIM_TIMING").is_some() {
-        eprintln!("t3sim timing: run {:?} write {:?} (threads {threads})", t_run, t0.elapsed() - t_run);
+        eprintln!("t3sim timing: sim {:?} run {:?} write {:?} (threads {threads})", t_sim, t_run, t0.elapsed() - t_run);
     }
     if leak {
         std::mem::forget(s);
