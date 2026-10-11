@@ -4,6 +4,7 @@
 //! `file:function` in comments where the ordering of side effects matters.
 
 use std::cmp::Ordering;
+use std::collections::binary_heap::PeekMut;
 use std::collections::{BinaryHeap, HashMap};
 use std::io;
 use std::path::Path;
@@ -690,14 +691,16 @@ impl Sim {
 
         // Kernel.runner
         while !self.heap.is_empty() && self.current_time != 0 && self.current_time <= self.cfg.stop_time {
-            let e = self.heap.pop().unwrap();
+            let mut top = self.heap.peek_mut().unwrap();
+            let e = *top;
             self.current_time = e.time;
             let r = e.recipient() as usize;
             if self.agent_times[r] > e.time {
-                let t = self.agent_times[r];
-                self.heap.push(Entry { time: t, ..e });
+                // Requeue at the agent's time: same queue contents as pop + push, one sift.
+                top.time = self.agent_times[r];
                 continue;
             }
+            PeekMut::pop(top);
             self.agent_times[r] = e.time;
             let msg = std::mem::replace(&mut self.slots[e.slot as usize], Msg::Wakeup);
             self.free_slots.push(e.slot);
