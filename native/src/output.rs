@@ -11,16 +11,17 @@
 //! Speed: the parquet crate's generic column writers cost ~110 ms per 1M rows, so the
 //! page bytes are encoded here (v1 data pages, uncompressed: snappy saved 2-10% of bytes on
 //! these encodings for real CPU time; DELTA_BINARY_PACKED ints,
-//! dictionary strings, no statistics) and spliced into a `SerializedFileWriter`
-//! with `append_column`, which still writes the footer/schema/metadata.
-//! Columns are read through per-row closures (no materialized column vectors), every
-//! (row group, column) chunk is encoded as an independent job on `threads` workers, and the
-//! file is assembled in memory so its SHA-256 comes without reading it back.
+//! dictionary strings, no statistics). The simulator's files are written by `StreamFile`
+//! while the run goes on (row group by row group, hashed as written; the one column whose
+//! values settle only at the end goes last); the whole-column writers below splice chunks into
+//! a `SerializedFileWriter` with `append_column` and assemble the file in memory.
+//! Columns are read through per-row closures (no materialized column vectors), and every
+//! (row group, column) chunk is encoded as an independent job.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,8 +29,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use parquet::basic::{Compression, Encoding};
 use parquet::column::writer::ColumnCloseResult;
-use parquet::file::metadata::{ColumnChunkMetaData, KeyValue};
-use parquet::file::properties::WriterProperties;
+use parquet::file::metadata::{ColumnChunkMetaData, FileMetaData, KeyValue, ParquetMetaData, ParquetMetaDataWriter, RowGroupMetaData};
+use parquet::file::properties::{WriterProperties, DEFAULT_CREATED_BY};
+use parquet::schema::types::SchemaDescriptor;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use sha2::{Digest, Sha256};
@@ -483,56 +485,206 @@ fn dict_data_page(c: &mut Chunk, dict_len: usize, rows: usize, ids: &[u32]) {
     c.page(PAGE_DATA, rows, ENC_RLE_DICT, &body);
 }
 
-/// Assembles a file from per-column page fragments: `pages[col][page]`, where page `p` holds
-/// `page_rows[p]` rows in every column. Consecutive pages form row groups of at most ROW_GROUP
-/// rows (at least one page each); `dicts[col]` is the fixed table of a dictionary column.
-/// Returns the SHA-256.
-fn assemble_pages(
-    path: &Path,
-    schema: &str,
-    pandas_json: &str,
-    arrow_schema_b64: &str,
-    dicts: &[Option<&'static [&'static str]>],
-    pages: Vec<Vec<Chunk>>,
-    page_rows: &[usize],
-) -> io::Result<String> {
-    let mut groups: Vec<(usize, usize)> = Vec::new(); // (rows, pages)
-    let (mut rows, mut np) = (0, 0);
-    for &r in page_rows {
-        if np > 0 && rows + r > ROW_GROUP {
-            groups.push((rows, np));
-            (rows, np) = (0, 0);
+/// A parquet file written front to back while the run goes on. Pages arrive in row order;
+/// consecutive pages form row groups of at most ROW_GROUP rows (at least one page each), and a
+/// closed group's column chunks are written and hashed at once, except those of the `late`
+/// column, whose pages only exist at the end: `finish` writes that column's chunk for every
+/// group after all the others, then the footer. The footer records every chunk's offset, so
+/// readers do not depend on the order of chunks in the file.
+pub struct StreamFile {
+    file: File,
+    hash: Sha256,
+    pos: u64,
+    schema: &'static str,
+    pandas_json: &'static str,
+    arrow_schema_b64: &'static str,
+    dicts: &'static [Option<&'static [&'static str]>],
+    late: Option<usize>,
+    /// The open row group's chunk per column (the late column's stays empty).
+    open: Vec<Chunk>,
+    open_rows: usize,
+    open_pages: usize,
+    groups: Vec<Group>,
+}
+
+/// A closed row group: its rows, its page count and where each column chunk went.
+struct Group {
+    rows: usize,
+    pages: usize,
+    cols: Vec<Option<Placed>>,
+}
+
+/// A column chunk written at `offset`.
+struct Placed {
+    offset: u64,
+    len: usize,
+    uncompressed: i64,
+    first_data: usize,
+    dict: bool,
+    num_values: i64,
+}
+
+impl StreamFile {
+    pub fn trace(path: &Path, dicts: &'static [Option<&'static [&'static str]>; 7], late: usize) -> io::Result<Self> {
+        Self::create(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, dicts, Some(late))
+    }
+
+    pub fn messages(path: &Path, dicts: &'static [Option<&'static [&'static str]>; 10]) -> io::Result<Self> {
+        Self::create(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, dicts, None)
+    }
+
+    fn create(
+        path: &Path,
+        schema: &'static str,
+        pandas_json: &'static str,
+        arrow_schema_b64: &'static str,
+        dicts: &'static [Option<&'static [&'static str]>],
+        late: Option<usize>,
+    ) -> io::Result<Self> {
+        let mut f = StreamFile {
+            file: File::create(path)?,
+            hash: Sha256::new(),
+            pos: 0,
+            schema,
+            pandas_json,
+            arrow_schema_b64,
+            dicts,
+            late,
+            open: Vec::new(),
+            open_rows: 0,
+            open_pages: 0,
+            groups: Vec::new(),
+        };
+        f.open = (0..dicts.len()).map(|c| f.fresh(c)).collect();
+        f.put_bytes(b"PAR1")?;
+        Ok(f)
+    }
+
+    fn fresh(&self, c: usize) -> Chunk {
+        match self.dicts[c] {
+            Some(t) => dict_chunk(t),
+            None => Chunk::new(),
         }
-        rows += r;
-        np += 1;
     }
-    if np > 0 {
-        groups.push((rows, np));
+
+    fn put_bytes(&mut self, b: &[u8]) -> io::Result<()> {
+        self.file.write_all(b)?;
+        self.hash.update(b);
+        self.pos += b.len() as u64;
+        Ok(())
     }
-    let mut cols: Vec<_> = pages.into_iter().map(Vec::into_iter).collect();
-    let mut chunks = Vec::with_capacity(groups.len() * dicts.len());
-    for &(_, np) in &groups {
-        for (c, d) in dicts.iter().enumerate() {
-            let mut chunk = match d {
-                Some(t) => dict_chunk(t),
-                None => Chunk::new(),
-            };
-            for pg in cols[c].by_ref().take(np) {
-                chunk.append(&pg);
+
+    fn put(&mut self, c: Chunk) -> io::Result<Placed> {
+        let p = Placed {
+            offset: self.pos,
+            len: c.buf.len(),
+            uncompressed: c.uncompressed,
+            first_data: c.first_data.expect("data page"),
+            dict: c.dict,
+            num_values: c.num_values,
+        };
+        self.put_bytes(&c.buf)?;
+        Ok(p)
+    }
+
+    /// Appends pages in row order: `pages[col][p]` holds `page_rows[p]` rows (`pages[late]` is
+    /// empty; that column's pages go to `finish`).
+    pub fn push(&mut self, page_rows: &[usize], pages: Vec<Vec<Chunk>>) -> io::Result<()> {
+        let mut cols: Vec<_> = pages.into_iter().map(Vec::into_iter).collect();
+        for &r in page_rows {
+            if self.open_pages > 0 && self.open_rows + r > ROW_GROUP {
+                self.close_group()?;
             }
-            chunks.push(chunk);
+            for (c, col) in cols.iter_mut().enumerate() {
+                if Some(c) != self.late {
+                    self.open[c].append(&col.next().expect("page per column"));
+                }
+            }
+            self.open_rows += r;
+            self.open_pages += 1;
         }
+        Ok(())
     }
-    let rg_rows: Vec<usize> = groups.iter().map(|g| g.0).collect();
-    assemble(path, schema, pandas_json, arrow_schema_b64, &rg_rows, chunks)
-}
 
-pub fn assemble_trace_pages(path: &Path, dicts: &[Option<&'static [&'static str]>; 7], pages: Vec<Vec<Chunk>>, page_rows: &[usize]) -> io::Result<String> {
-    assemble_pages(path, TRACE_SCHEMA, TRACE_PANDAS, TRACE_ARROW, dicts, pages, page_rows)
-}
+    fn close_group(&mut self) -> io::Result<()> {
+        let mut cols = Vec::with_capacity(self.open.len());
+        for c in 0..self.open.len() {
+            if Some(c) == self.late {
+                cols.push(None);
+                continue;
+            }
+            let fresh = self.fresh(c);
+            let chunk = std::mem::replace(&mut self.open[c], fresh);
+            cols.push(Some(self.put(chunk)?));
+        }
+        self.groups.push(Group { rows: self.open_rows, pages: self.open_pages, cols });
+        (self.open_rows, self.open_pages) = (0, 0);
+        Ok(())
+    }
 
-pub fn assemble_message_pages(path: &Path, dicts: &[Option<&'static [&'static str]>; 10], pages: Vec<Vec<Chunk>>, page_rows: &[usize]) -> io::Result<String> {
-    assemble_pages(path, MSG_SCHEMA, MSG_PANDAS, MSG_ARROW, dicts, pages, page_rows)
+    /// Writes the late column's chunks (`late_pages`: all of its pages in row order), then the
+    /// footer; returns the file's SHA-256.
+    pub fn finish(mut self, late_pages: Vec<Chunk>) -> io::Result<String> {
+        if self.open_pages > 0 {
+            self.close_group()?;
+        }
+        if let Some(l) = self.late {
+            let mut pages = late_pages.into_iter();
+            for g in 0..self.groups.len() {
+                let mut chunk = self.fresh(l);
+                for pg in pages.by_ref().take(self.groups[g].pages) {
+                    chunk.append(&pg);
+                }
+                let placed = self.put(chunk)?;
+                self.groups[g].cols[l] = Some(placed);
+            }
+        }
+        let descr = Arc::new(SchemaDescriptor::new(Arc::new(parse_message_type(self.schema).map_err(err)?)));
+        let mut row_groups = Vec::with_capacity(self.groups.len());
+        for (i, g) in self.groups.iter().enumerate() {
+            let mut cols = Vec::with_capacity(g.cols.len());
+            for (c, p) in g.cols.iter().enumerate() {
+                let p = p.as_ref().expect("chunk per column");
+                let enc = if p.dict {
+                    vec![Encoding::PLAIN, Encoding::RLE, Encoding::RLE_DICTIONARY]
+                } else {
+                    vec![Encoding::RLE, Encoding::DELTA_BINARY_PACKED]
+                };
+                let meta = ColumnChunkMetaData::builder(descr.column(c))
+                    .set_compression(Compression::UNCOMPRESSED)
+                    .set_encodings(enc)
+                    .set_num_values(p.num_values)
+                    .set_total_compressed_size(p.len as i64)
+                    .set_total_uncompressed_size(p.uncompressed)
+                    .set_data_page_offset((p.offset + p.first_data as u64) as i64)
+                    .set_dictionary_page_offset(if p.dict { Some(p.offset as i64) } else { None })
+                    .build()
+                    .map_err(err)?;
+                cols.push(meta);
+            }
+            let first = g.cols.iter().flatten().map(|p| p.offset).min().expect("columns");
+            let rg = RowGroupMetaData::builder(descr.clone())
+                .set_num_rows(g.rows as i64)
+                .set_total_byte_size(g.cols.iter().flatten().map(|p| p.uncompressed).sum())
+                .set_column_metadata(cols)
+                .set_ordinal(i as i32)
+                .set_file_offset(first as i64)
+                .build()
+                .map_err(err)?;
+            row_groups.push(rg);
+        }
+        let kv = vec![
+            KeyValue::new("ARROW:schema".to_string(), self.arrow_schema_b64.to_string()),
+            KeyValue::new("pandas".to_string(), self.pandas_json.to_string()),
+        ];
+        let num_rows = self.groups.iter().map(|g| g.rows as i64).sum();
+        let file_meta = FileMetaData::new(1, num_rows, Some(DEFAULT_CREATED_BY.to_string()), Some(kv), descr, None);
+        let meta = ParquetMetaData::new(file_meta, row_groups);
+        let mut footer = Vec::new();
+        ParquetMetaDataWriter::new(&mut footer, &meta).finish().map_err(err)?;
+        self.put_bytes(&footer)?;
+        Ok(hex(&self.hash.finalize()))
+    }
 }
 
 /// Number of independent encode jobs for `n` rows of `ncols` columns: one per (row group, column).

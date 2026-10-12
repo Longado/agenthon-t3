@@ -57,33 +57,44 @@ fn prepare(config_path: &Path, seed: Option<i64>) -> Result<Prepared, String> {
 /// Run one prepared scenario and write trace.parquet, events.json and, when `ledger`,
 /// message_trace.parquet. `threads` is this scenario's CPU budget; `leak` skips freeing the
 /// simulation state (the process is about to exit, and unmapping hundreds of MB is measurable).
-/// Ok(None): the run emitted trace events out of time order, nothing was written, and the caller
-/// must fall back.
+/// Ok(None): the run emitted trace events out of time order, its partial files were removed, and
+/// the caller must fall back.
 fn run_one(p: Prepared, trace_path: &Path, threads: usize, leak: bool, ledger: bool) -> std::io::Result<Option<Value>> {
     let t0 = Instant::now();
     let scenario_id = p.cfg.scenario_id.clone();
+    let dir = trace_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+    let msg_path = dir.join("message_trace.parquet");
+    let trace_file = sim::trace_file(trace_path)?;
+    let msg_file = if ledger { Some(sim::message_file(&msg_path)?) } else { None };
     let mut s = sim::Sim::new(p.cfg);
     let mut t_sim = Default::default();
     // Trace segments and message_trace pages are encoded by `threads - 1` helpers while the
-    // simulation runs; the main thread drains whatever is left once it finishes.
+    // simulation runs (the main thread encodes whatever is left once it finishes), and one more
+    // thread writes them to the files in row order as they come.
     let (tx, rx) = mpsc::channel();
-    let (rx, enc) = (Mutex::new(rx), Mutex::new(sim::Encoded::default()));
-    std::thread::scope(|sc| {
+    let rx = Mutex::new(rx);
+    let (done_tx, done_rx) = mpsc::channel();
+    let streamed = std::thread::scope(|sc| {
+        let writer = sc.spawn(move || sim::write_ahead(done_rx, trace_file, msg_file));
         for _ in 1..threads {
-            sc.spawn(|| sim::work(&rx, &enc));
+            let (rx, done_tx) = (&rx, done_tx.clone());
+            sc.spawn(move || sim::work(rx, &done_tx));
         }
         s.run(tx, ledger, threads > 1);
         t_sim = t0.elapsed();
-        sim::work(&rx, &enc);
-    });
+        sim::work(&rx, &done_tx);
+        drop(done_tx);
+        writer.join().expect("file writer panicked")
+    })?;
     if s.disordered() {
+        drop(streamed);
+        let _ = std::fs::remove_file(trace_path);
+        let _ = std::fs::remove_file(&msg_path);
         return Ok(None);
     }
-    let enc = enc.into_inner().unwrap();
     let t_run = t0.elapsed();
-    let dir = trace_path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&dir)?;
-    let w = s.write_outputs(enc, trace_path, &dir.join("message_trace.parquet"))?;
+    let w = s.write_outputs(streamed, threads)?;
     if std::env::var_os("T3SIM_TIMING").is_some() {
         eprintln!("t3sim timing: sim {:?} run {:?} write {:?} (threads {threads})", t_sim, t_run, t0.elapsed() - t_run);
     }

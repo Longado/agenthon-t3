@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 
-use crate::output::{self, Chunk, Col};
+use crate::output::{self, Chunk, Col, StreamFile};
 use crate::queue::{Entry, Queue};
 use crate::rng::RandomState;
 use crate::scenario::{AgentKind, Config, LatencyKind};
@@ -266,43 +266,126 @@ pub struct SegPages {
     execs: Vec<(u32, u32, u32)>,
 }
 
-/// What the encoder pool produced: message pages by block, trace segments by index.
-#[derive(Default)]
-pub struct Encoded {
-    msg_blocks: Vec<Vec<Option<Chunk>>>,
-    msg_rows: usize,
-    segs: Vec<Option<SegPages>>,
+/// An encoded piece on its way to the file writer.
+pub enum Done {
+    /// Trace segment `idx`.
+    Trace(usize, SegPages),
+    /// Column `c` of message block `b`, which holds `rows` rows.
+    Msg(usize, usize, usize, Chunk),
 }
 
-/// Encodes jobs from `rx` until every sender is gone. Any number of threads may call this on the
-/// same receiver concurrently.
-pub fn work(rx: &Mutex<mpsc::Receiver<Job>>, into: &Mutex<Encoded>) {
+/// Encodes jobs from `rx` until every sender is gone and hands the results to the file writer.
+/// Any number of threads may call this on the same receiver concurrently.
+pub fn work(rx: &Mutex<mpsc::Receiver<Job>>, out: &mpsc::Sender<Done>) {
     loop {
         let next = rx.lock().unwrap().recv();
         let Ok(job) = next else { break };
-        match job {
+        let done = match job {
             Job::Msg(MsgBlock(b, c, block)) => {
                 let page = msg_cols(&block, b * output::PAGE, |cols| output::encode_page(&cols[c], 0, block.len()));
-                let mut e = into.lock().unwrap();
-                if c == 0 {
-                    e.msg_rows += block.len();
-                }
-                if e.msg_blocks.len() <= b {
-                    e.msg_blocks.resize_with(b + 1, || (0..MSG_COLS).map(|_| None).collect());
-                }
-                e.msg_blocks[b][c] = Some(page);
+                Done::Msg(b, c, block.len(), page)
             }
             Job::Trace(seg) => {
                 let idx = seg.idx;
-                let pages = seg.encode();
-                let mut e = into.lock().unwrap();
-                if e.segs.len() <= idx {
-                    e.segs.resize_with(idx + 1, || None);
-                }
-                e.segs[idx] = Some(pages);
+                Done::Trace(idx, seg.encode())
             }
+        };
+        // The writer drains its receiver until every encoder is gone, even after a write error.
+        out.send(done).expect("file writer alive");
+    }
+}
+
+/// trace.parquet, its msg_type column left for the end of the run.
+pub fn trace_file(path: &Path) -> io::Result<StreamFile> {
+    StreamFile::trace(path, &TRACE_DICTS, TRACE_KIND)
+}
+
+pub fn message_file(path: &Path) -> io::Result<StreamFile> {
+    StreamFile::messages(path, &MSG_DICTS)
+}
+
+/// The files as the run leaves them: everything written but the trace's msg_type column and
+/// the footers. `segs` keeps each trace segment's kinds and execution rows (pages taken).
+pub struct Streamed {
+    trace: StreamFile,
+    msgs: Option<StreamFile>,
+    msg_blocks: usize,
+    msg_rows: usize,
+    segs: Vec<SegPages>,
+}
+
+/// A message block's column pages as they arrive.
+struct MsgPending {
+    rows: usize,
+    cols: Vec<Vec<Chunk>>,
+    have: usize,
+}
+
+/// Writes what the encoders finish to the files in row order while the run goes on, until every
+/// encoder is gone. After a write error it only drains (the encoders must not block) and returns
+/// the error at the end.
+pub fn write_ahead(rx: mpsc::Receiver<Done>, trace: StreamFile, msgs: Option<StreamFile>) -> io::Result<Streamed> {
+    let mut out = Streamed { trace, msgs, msg_blocks: 0, msg_rows: 0, segs: Vec::new() };
+    let (mut segs, mut blocks) = (Vec::new(), Vec::new());
+    let mut failed = None;
+    for done in rx {
+        if failed.is_none() {
+            failed = out.take(done, &mut segs, &mut blocks).err();
         }
     }
+    failed.map_or(Ok(out), Err)
+}
+
+impl Streamed {
+    fn take(&mut self, done: Done, segs: &mut Vec<Option<SegPages>>, blocks: &mut Vec<Option<MsgPending>>) -> io::Result<()> {
+        match done {
+            Done::Trace(i, sp) => {
+                if segs.len() <= i {
+                    segs.resize_with(i + 1, || None);
+                }
+                segs[i] = Some(sp);
+                while let Some(mut sp) = segs.get_mut(self.segs.len()).and_then(Option::take) {
+                    self.trace.push(&sp.page_rows, std::mem::take(&mut sp.pages))?;
+                    self.segs.push(sp);
+                }
+            }
+            Done::Msg(b, c, rows, page) => {
+                if blocks.len() <= b {
+                    blocks.resize_with(b + 1, || None);
+                }
+                let m = blocks[b].get_or_insert_with(|| MsgPending { rows, cols: (0..MSG_COLS).map(|_| Vec::new()).collect(), have: 0 });
+                m.cols[c].push(page);
+                m.have += 1;
+                let file = self.msgs.as_mut().expect("message file");
+                while blocks.get(self.msg_blocks).is_some_and(|m| m.as_ref().is_some_and(|m| m.have == MSG_COLS)) {
+                    let m = blocks[self.msg_blocks].take().expect("complete block");
+                    file.push(&[m.rows], m.cols)?;
+                    self.msg_rows += m.rows;
+                    self.msg_blocks += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// msg_type pages of a trace segment: an execution row is ORDER_FILLED only if it is its
+/// order's last execution (`last_exec`: order id -> log index), PARTIAL_FILL otherwise.
+fn kind_pages(mut sp: SegPages, last_exec: &[u32]) -> Vec<Chunk> {
+    for &(r, k, id) in &sp.execs {
+        sp.kinds[r as usize] = if last_exec[id as usize] == k { 4 } else { 5 };
+    }
+    let kinds = &sp.kinds;
+    let kind = |i: usize| kinds[i] as u32;
+    let col = Col::Dict(&TRACE_TYPES, &kind);
+    let mut s = 0;
+    sp.page_rows
+        .iter()
+        .map(|&r| {
+            s += r;
+            output::encode_page(&col, s - r, s)
+        })
+        .collect()
 }
 
 impl TraceSeg {
@@ -1466,65 +1549,42 @@ impl Sim {
 
     // --- outputs -----------------------------------------------------------------------------
 
-    /// abides_fork/trace.py:extract_trace and extract_message_trace, from the pages the encoder
-    /// pool made during the run: the message file is assembled on one thread while the trace's
-    /// msg_type column (execution kinds are only final now) is encoded and its file assembled.
-    pub fn write_outputs(&self, enc: Encoded, trace_path: &Path, msg_path: &Path) -> io::Result<Written> {
-        let Encoded { msg_blocks, msg_rows, segs } = enc;
-        let ledger = self.ledger;
-        let write_msgs = move || -> io::Result<Option<String>> {
-            if !ledger {
-                return Ok(None);
+    /// abides_fork/trace.py:extract_trace and extract_message_trace, finished once the run is
+    /// over: the trace's msg_type pages (execution kinds are only final now) are encoded on
+    /// `threads` cores and written after the trace's other columns, then both footers.
+    pub fn write_outputs(&self, out: Streamed, threads: usize) -> io::Result<Written> {
+        let Streamed { trace, msgs, msg_rows, segs, .. } = out;
+        let n_events = segs.iter().flat_map(|sp| &sp.page_rows).sum::<usize>();
+        let last_exec = &self.last_exec;
+        let finish_trace = move || -> io::Result<String> {
+            let per = segs.len().div_ceil(threads.max(1)).max(1);
+            let mut parts: Vec<Vec<SegPages>> = Vec::new();
+            let mut it = segs.into_iter().peekable();
+            while it.peek().is_some() {
+                parts.push(it.by_ref().take(per).collect());
             }
-            let mut cols: Vec<Vec<Chunk>> = (0..MSG_COLS).map(|_| Vec::with_capacity(msg_blocks.len())).collect();
-            for b in msg_blocks {
-                for (c, page) in b.into_iter().enumerate() {
-                    cols[c].push(page.expect("message page encoded"));
-                }
-            }
-            let page_rows: Vec<usize> = (0..msg_rows).step_by(output::PAGE).map(|s| (msg_rows - s).min(output::PAGE)).collect();
-            output::assemble_message_pages(msg_path, &MSG_DICTS, cols, &page_rows).map(Some)
+            let encode = |part: Vec<SegPages>| part.into_iter().flat_map(|sp| kind_pages(sp, last_exec)).collect::<Vec<Chunk>>();
+            let pages = if parts.len() <= 1 {
+                parts.into_iter().flat_map(encode).collect()
+            } else {
+                std::thread::scope(|sc| {
+                    let hs: Vec<_> = parts.into_iter().map(|part| sc.spawn(move || encode(part))).collect();
+                    hs.into_iter().flat_map(|h| h.join().expect("msg_type encoder panicked")).collect()
+                })
+            };
+            trace.finish(pages)
         };
-        let write_trace = || -> io::Result<(usize, String)> {
-            let segs: Vec<SegPages> = segs.into_iter().map(|s| s.expect("trace segment encoded")).collect();
-            let mut by_col: Vec<Vec<Chunk>> = (0..7).map(|_| Vec::new()).collect();
-            let mut page_rows = Vec::new();
-            let mut n = 0;
-            for mut sp in segs {
-                for &(r, k, id) in &sp.execs {
-                    sp.kinds[r as usize] = if self.last_exec[id as usize] == k { 4 } else { 5 };
-                }
-                let kinds = &sp.kinds;
-                let kind = |i: usize| kinds[i] as u32;
-                let col = Col::Dict(&TRACE_TYPES, &kind);
-                let mut s = 0;
-                for &r in &sp.page_rows {
-                    by_col[TRACE_KIND].push(output::encode_page(&col, s, s + r));
-                    s += r;
-                }
-                for (c, pages) in sp.pages.into_iter().enumerate() {
-                    if c != TRACE_KIND {
-                        by_col[c].extend(pages);
-                    }
-                }
-                n += s;
-                page_rows.extend(sp.page_rows);
-            }
-            let sha = output::assemble_trace_pages(trace_path, &TRACE_DICTS, by_col, &page_rows)?;
-            Ok((n, sha))
+        let (t, m) = match msgs {
+            Some(msgs) => std::thread::scope(|sc| {
+                let h = sc.spawn(move || msgs.finish(Vec::new()));
+                let t = finish_trace();
+                (t, Some(h.join().expect("message writer panicked")))
+            }),
+            None => (finish_trace(), None),
         };
-        let (t, m) = if ledger {
-            std::thread::scope(|sc| {
-                let h = sc.spawn(write_msgs);
-                let t = write_trace();
-                (t, h.join().expect("message writer panicked"))
-            })
-        } else {
-            (write_trace(), Ok(None))
-        };
-        let (n_events, trace_sha) = t?;
-        let m = m?;
-        Ok(Written { n_events: n_events as u64, trace_sha, n_messages: m.as_ref().map(|_| msg_rows as u64), message_sha: m })
+        let trace_sha = t?;
+        let message_sha = m.transpose()?;
+        Ok(Written { n_events: n_events as u64, trace_sha, n_messages: message_sha.as_ref().map(|_| msg_rows as u64), message_sha })
     }
 }
 
