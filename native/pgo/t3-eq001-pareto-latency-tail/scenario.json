@@ -1,0 +1,82 @@
+{
+  "scenario_id": "e90a1b02-0001-4a3c-8b21-0f1e2d3c4b5a",
+  "description": "Pareto heavy-tail network latency across 12 agents: occasional extreme delays reorder message arrival relative to send order, stressing causal event-queue ordering. A static-batched port that assumes uniform/simultaneous delivery breaks Tier-A fills and the message-level latency-causality gate.",
+  "scenario_family": "latency-profile",
+  "schema_version": 2,
+  "seed": 3010001,
+  "horizon_ns": 20000000000,
+
+  "agent_mix": {
+    "NoiseTrader": 9,
+    "ValueTrader": 3
+  },
+
+  "exchange_config": {
+    "symbol": "SYM",
+    "tick_size": 1,
+    "lot_size": 1,
+    "min_price": 1,
+    "max_price": 1000000,
+    "stp_policy": "cancel_newest",
+    "order_types_allowed": ["LIMIT", "MARKET", "CANCEL", "REPLACE"]
+  },
+
+  "oracle_config": {
+    "type": "mean_reverting",
+    "params": {
+      "initial_price": 200000,
+      "kappa": 0.05,
+      "sigma": 0.001,
+      "dt_ns": 1000000,
+      "noise_type": "gaussian",
+      "jump_intensity": 0.0,
+      "jump_sigma": 0.0
+    }
+  },
+
+  "latency_config": {
+    "model": "pareto",
+    "params": {
+      "alpha": 1.5,
+      "scale_ns": 3000,
+      "min_ns": 100,
+      "max_ns": 80000000
+    }
+  },
+
+  "agent_configs": [
+    {
+      "agent_type": "NoiseTrader",
+      "count": 9,
+      "params": {
+        "order_size_mean": 8,
+        "order_size_std": 2,
+        "arrival_rate_hz": 18.0,
+        "price_offset_ticks": 5
+      }
+    },
+    {
+      "agent_type": "ValueTrader",
+      "count": 3,
+      "params": {
+        "fundamental_value_source": "oracle",
+        "order_size_mean": 40,
+        "threshold_ticks": 5,
+        "arrival_rate_hz": 1.0
+      }
+    }
+  ],
+
+  "output_config": {
+    "trace_cols": ["t_ns", "agent_id", "msg_type", "side", "price", "size", "order_id"],
+    "events_fields": ["scenario_id", "n_events", "wall_clock_sec", "events_per_sec", "seed", "trace_sha256"],
+    "snapshot_interval_ns": 0
+  },
+
+  "tolerance": {
+    "tier": "A",
+    "timestamp_tolerance_ns": 1000,
+    "kendall_tau_floor": 0.999,
+    "spread_bps_tolerance": 10.0
+  }
+}
