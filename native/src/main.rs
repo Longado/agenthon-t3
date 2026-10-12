@@ -216,6 +216,9 @@ fn cmd_batch(args: &[String]) {
     let out_dir = PathBuf::from(out_dir);
     let names: Vec<String> = subs.iter().map(|p| p.file_stem().unwrap().to_string_lossy().into_owned()).collect();
     let workers = cpu_budget().min(prepared.len());
+    // With fewer subs than cores, each sub also gets the spare cores for its encoders and its
+    // latency draws, as a single-scenario run does.
+    let per_sub = (cpu_budget() / prepared.len()).max(1);
     // Subs are independent simulations; run them on all available cores, results kept in sub order.
     let jobs: Vec<(usize, Prepared)> = prepared.into_iter().enumerate().collect();
     let queue = std::sync::Mutex::new(jobs.into_iter());
@@ -226,7 +229,7 @@ fn cmd_batch(args: &[String]) {
                 let next = queue.lock().unwrap().next();
                 let Some((i, p)) = next else { break };
                 // Batch units need a ledger per sub whatever the card says.
-                let r = run_one(p, &out_dir.join(&names[i]).join("trace.parquet"), 1, false, true);
+                let r = run_one(p, &out_dir.join(&names[i]).join("trace.parquet"), per_sub, false, true);
                 *results[i].lock().unwrap() = Some(r);
             });
         }
