@@ -4,6 +4,7 @@
 //! `file:function` in comments where the ordering of side effects matters.
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
@@ -504,13 +505,88 @@ fn opt(v: i64) -> Option<i64> {
 struct Level {
     price: i64,
     total: i64,
-    orders: std::collections::VecDeque<Order>,
+    orders: VecDeque<Order>,
+}
+
+const NO_LEVEL: Level = Level { price: 0, total: 0, orders: VecDeque::new() };
+
+/// One side of the book, sorted best first with one level per price: `v[start..]`, with spare
+/// slots in front. A level that appears or empties moves the levels on its shorter side, so a
+/// change at the best price moves none. A plain Vec shifted every level behind the best one,
+/// which grew with the book's depth (a third of the run with ~1,000 agents). The levels stay
+/// one slice, so the scans from the best level remain a plain walk.
+#[derive(Default)]
+struct Levels {
+    v: Vec<Level>,
+    start: usize,
+}
+
+impl Levels {
+    #[inline]
+    fn len(&self) -> usize {
+        self.v.len() - self.start
+    }
+    #[inline]
+    fn get(&self, i: usize) -> Option<&Level> {
+        self.v.get(self.start + i)
+    }
+    #[inline]
+    fn as_slice(&self) -> &[Level] {
+        &self.v[self.start..]
+    }
+    #[inline]
+    fn front(&self) -> Option<&Level> {
+        self.get(0)
+    }
+    #[inline]
+    fn front_mut(&mut self) -> Option<&mut Level> {
+        self.v.get_mut(self.start)
+    }
+    fn insert(&mut self, i: usize, level: Level) {
+        if i >= self.len() - i {
+            return self.v.insert(self.start + i, level);
+        }
+        if self.start == 0 {
+            // Open spare slots in front: one move of every level, reused by later inserts here.
+            let gap = self.len().max(8);
+            self.v.splice(0..0, (0..gap).map(|_| NO_LEVEL));
+            self.start = gap;
+        }
+        self.start -= 1;
+        self.v[self.start] = level;
+        self.v[self.start..=self.start + i].rotate_left(1);
+    }
+    fn remove(&mut self, i: usize) {
+        let p = self.start + i;
+        if i >= self.len() - i {
+            self.v.remove(p);
+            return;
+        }
+        self.v[p] = NO_LEVEL;
+        self.v[self.start..=p].rotate_right(1);
+        self.start += 1;
+    }
+}
+
+impl std::ops::Index<usize> for Levels {
+    type Output = Level;
+    #[inline]
+    fn index(&self, i: usize) -> &Level {
+        &self.v[self.start + i]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Levels {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut Level {
+        &mut self.v[self.start + i]
+    }
 }
 
 #[derive(Default)]
 struct Book {
-    bids: Vec<Level>, // best (highest) first
-    asks: Vec<Level>, // best (lowest) first
+    bids: Levels, // best (highest) first
+    asks: Levels, // best (lowest) first
     last_trade: i64,
 }
 
@@ -520,6 +596,17 @@ fn better(side: Side, order_price: i64, level_price: i64) -> bool {
     match side {
         Side::Bid => order_price > level_price,
         Side::Ask => order_price < level_price,
+    }
+}
+
+/// Index of the first level on `side` that `price` beats or matches, where Python's scan from the
+/// best level stops (it checks the worst level first, so a price beyond it costs no scan).
+#[inline]
+fn level_index(book: &Levels, side: Side, price: i64) -> usize {
+    let levels = book.as_slice();
+    match levels.last() {
+        Some(worst) if !better(side, worst.price, price) => levels.iter().position(|l| !better(side, l.price, price)).unwrap(),
+        _ => levels.len(),
     }
 }
 
@@ -1398,8 +1485,8 @@ impl Sim {
             }
             Msg::MarketClosePriceRequest => self.close_price_subs.push(sender),
             Msg::QuerySpread => {
-                let bid = self.book.bids.first().filter(|l| l.total > 0).map(|l| l.price);
-                let ask = self.book.asks.first().filter(|l| l.total > 0).map(|l| l.price);
+                let bid = self.book.bids.front().filter(|l| l.total > 0).map(|l| l.price);
+                let ask = self.book.asks.front().filter(|l| l.total > 0).map(|l| l.price);
                 let mkt_closed = t > self.cfg.mkt_close;
                 self.exchange_send(sender, Msg::QuerySpreadResponse { bid, ask, mkt_closed });
             }
@@ -1424,7 +1511,7 @@ impl Sim {
                     Side::Bid => &self.book.asks,
                     Side::Ask => &self.book.bids,
                 };
-                if let Some(level) = opp.first() {
+                if let Some(level) = opp.front() {
                     if crosses(&order, level.price) {
                         let resting = *level.orders.front().unwrap();
                         if resting.agent == order.agent {
@@ -1455,11 +1542,11 @@ impl Sim {
             }
         }
         let t = self.ex_time;
-        if let Some(l) = self.book.bids.first() {
+        if let Some(l) = self.book.bids.front() {
             let (price, qty) = (l.price, l.total);
             self.log_quote(QuoteEvent { t, side: Side::Bid, price, qty });
         }
-        if let Some(l) = self.book.asks.first() {
+        if let Some(l) = self.book.asks.front() {
             let (price, qty) = (l.price, l.total);
             self.log_quote(QuoteEvent { t, side: Side::Ask, price, qty });
         }
@@ -1474,7 +1561,7 @@ impl Sim {
             Side::Bid => &mut self.book.asks,
             Side::Ask => &mut self.book.bids,
         };
-        let level = book.first_mut()?;
+        let level = book.front_mut()?;
         if !crosses(order, level.price) {
             return None;
         }
@@ -1509,22 +1596,12 @@ impl Sim {
             Side::Bid => &mut self.book.bids,
             Side::Ask => &mut self.book.asks,
         };
-        let new_level = |o: Order| Level { price: o.limit, total: o.qty, orders: std::collections::VecDeque::from([o]) };
-        if book.is_empty() || better(order.side, book.last().unwrap().price, order.limit) {
-            // book[-1].order_has_worse_price(order): the order is worse than the worst level.
-            book.push(new_level(order));
-            return;
-        }
-        for i in 0..book.len() {
-            if better(order.side, order.limit, book[i].price) {
-                book.insert(i, new_level(order));
-                return;
-            }
-            if book[i].price == order.limit {
-                book[i].total += order.qty;
-                book[i].orders.push_back(order);
-                return;
-            }
+        let i = level_index(book, order.side, order.limit);
+        if i < book.len() && book[i].price == order.limit {
+            book[i].total += order.qty;
+            book[i].orders.push_back(order);
+        } else {
+            book.insert(i, Level { price: order.limit, total: order.qty, orders: VecDeque::from([order]) });
         }
     }
 
@@ -1534,9 +1611,10 @@ impl Sim {
             Side::Bid => &mut self.book.bids,
             Side::Ask => &mut self.book.asks,
         };
-        let Some(i) = book.iter().position(|l| l.price == order.limit) else {
+        let i = level_index(book, order.side, order.limit);
+        if book.get(i).is_none_or(|l| l.price != order.limit) {
             return false;
-        };
+        }
         let level = &mut book[i];
         let Some(j) = level.orders.iter().position(|o| o.id == order.id) else {
             return false;
@@ -1616,4 +1694,39 @@ fn msg_cols<R>(block: &[MsgRow], base: usize, f: impl FnOnce(&[Col; 10]) -> R) -
         Col::OptI64(&order_id),
         Col::OptI64(&causal),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Level, Levels, NO_LEVEL};
+
+    /// Random inserts and removals at every position against a plain Vec of prices.
+    #[test]
+    fn levels_match_a_vec() {
+        let (mut l, mut v) = (Levels::default(), Vec::<i64>::new());
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: usize| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s % n as u64) as usize
+        };
+        for k in 0..50_000i64 {
+            let near_front = next(3) == 0;
+            if v.is_empty() || next(5) < 3 {
+                let i = if near_front { next(v.len().min(3) + 1) } else { next(v.len() + 1) };
+                l.insert(i, Level { price: k, ..NO_LEVEL });
+                v.insert(i, k);
+            } else {
+                let i = if near_front { next(v.len().min(3)) } else { next(v.len()) };
+                l.remove(i);
+                v.remove(i);
+            }
+            assert_eq!(l.len(), v.len());
+            assert_eq!(l.front().map(|x| x.price), v.first().copied());
+            if k % 97 == 0 {
+                assert!((0..v.len()).all(|i| l[i].price == v[i] && l.get(i).unwrap().price == v[i]));
+            }
+        }
+    }
 }
