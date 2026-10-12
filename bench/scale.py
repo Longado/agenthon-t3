@@ -25,6 +25,7 @@ ap.add_argument("new"); ap.add_argument("old")
 ap.add_argument("--n", type=int, default=40); ap.add_argument("--seed", type=int, default=1)
 ap.add_argument("--out", type=pathlib.Path, required=True)
 ap.add_argument("--max-events", type=float, default=35e6)
+ap.add_argument("--agent-lo", type=float, default=1); ap.add_argument("--agent-hi", type=float, default=12)
 ap.add_argument("--py-max", type=float, default=2.5e6); ap.add_argument("--py-jobs", type=int, default=6)
 a = ap.parse_args()
 
@@ -44,7 +45,7 @@ def make(r: random.Random, i: int):
     s = copy.deepcopy(base)
     s["scenario_id"] = f"scale-{i:03d}"
     s["seed"] = r.randrange(2**32)
-    agents = logu(r, 1, 12)
+    agents = logu(r, a.agent_lo, a.agent_hi)
     horizon = logu(r, 1, 6)
     for ac in s["agent_configs"]:
         ac["count"] = max(1, round(ac["count"] * agents))
