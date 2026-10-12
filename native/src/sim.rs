@@ -116,7 +116,8 @@ pub struct Order {
     pub side: Side,
     pub qty: i64,
     pub limit: i64,
-    pub fill_price: Option<i64>,
+    /// NONE until the order is filled (a sentinel keeps Msg at 48 bytes instead of 56).
+    pub fill_price: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -128,7 +129,8 @@ enum Msg {
     MarketClosePrice,
     MarketClosed,
     QuerySpread,
-    QuerySpreadResponse { bid: Option<(i64, i64)>, ask: Option<(i64, i64)>, mkt_closed: bool },
+    // Best bid and ask prices only: the traders never read the sizes.
+    QuerySpreadResponse { bid: Option<i64>, ask: Option<i64>, mkt_closed: bool },
     LimitOrder(Order),
     CancelOrder(Order),
     OrderAccepted(Order),
@@ -445,7 +447,8 @@ impl TraceSeg {
                 K_CANCELLED => (3, e.o.limit),
                 _ => {
                     execs.push((rows.len() as u32, (self.base + k as usize) as u32, e.o.id as u32));
-                    (4, e.o.fill_price.unwrap())
+                    assert!(e.o.fill_price != NONE, "execution without a fill price");
+                    (4, e.o.fill_price)
                 }
             };
             rows.push(TraceRow { t: e.t, order_id: e.o.id, price, size: e.o.qty, agent: e.o.agent as i32, kind, side: e.o.side.idx() as u8 });
@@ -1262,8 +1265,8 @@ impl Sim {
                 if mkt_closed {
                     tr.mkt_closed = true;
                 }
-                tr.known_bid = bid.map(|b| b.0);
-                tr.known_ask = ask.map(|a| a.0);
+                tr.known_bid = bid;
+                tr.known_ask = ask;
                 spread_response = true;
             }
             other => panic!("trader received unexpected {}", MSG_TYPES[other.type_idx() as usize]),
@@ -1284,7 +1287,7 @@ impl Sim {
     /// TradingAgent.place_limit_order (ignore_risk=True, quantity always > 0 here).
     fn place_limit_order(&mut self, agent: u32, side: Side, qty: i64, limit: i64) {
         let i = agent as usize - 1;
-        let o = Order { id: self.next_order_id, agent, side, qty, limit, fill_price: None };
+        let o = Order { id: self.next_order_id, agent, side, qty, limit, fill_price: NONE };
         self.next_order_id += 1;
         assert!(qty > 0, "non-positive order quantity");
         self.traders[i].orders.insert(&mut self.order_pos, o);
@@ -1395,8 +1398,8 @@ impl Sim {
             }
             Msg::MarketClosePriceRequest => self.close_price_subs.push(sender),
             Msg::QuerySpread => {
-                let bid = self.book.bids.first().filter(|l| l.total > 0).map(|l| (l.price, l.total));
-                let ask = self.book.asks.first().filter(|l| l.total > 0).map(|l| (l.price, l.total));
+                let bid = self.book.bids.first().filter(|l| l.total > 0).map(|l| l.price);
+                let ask = self.book.asks.first().filter(|l| l.total > 0).map(|l| l.price);
                 let mkt_closed = t > self.cfg.mkt_close;
                 self.exchange_send(sender, Msg::QuerySpreadResponse { bid, ask, mkt_closed });
             }
@@ -1490,7 +1493,7 @@ impl Sim {
             level.total -= order.qty;
             m
         };
-        matched.fill_price = Some(matched.limit);
+        matched.fill_price = matched.limit;
         let mut filled = *order;
         filled.qty = matched.qty;
         filled.fill_price = matched.fill_price;
