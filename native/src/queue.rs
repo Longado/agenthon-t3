@@ -1,5 +1,7 @@
 //! The kernel's event queue.
 
+use std::hint::select_unpredictable;
+
 /// Heap entry: Python orders `(deliver_at, (sender_id, recipient_id, message))`, and messages
 /// compare by message_id. `key` packs sender/recipient/message_id as 16/16/32 bits, so the order
 /// is one (i64, u64) comparison: scenario.rs refuses 2^16 or more agents, and message ids are
@@ -130,10 +132,13 @@ impl Queue {
         loop {
             let c = 4 * i + 1;
             let (m, rm) = if c + 4 <= n {
-                let h = &self.r[c..c + 4];
-                let (a, ka) = if h[1] < h[0] { (1, h[1]) } else { (0, h[0]) };
-                let (b, kb) = if h[3] < h[2] { (3, h[3]) } else { (2, h[2]) };
-                if kb < ka { (c + b, kb) } else { (c + a, ka) }
+                // select_unpredictable: a plain `if` here became a jump that x86 guessed wrong
+                // about half the time, the largest single cost of a run on Intel
+                let h: &[u128; 4] = self.r[c..c + 4].try_into().unwrap();
+                let a = select_unpredictable(h[1] < h[0], 1, 0);
+                let b = select_unpredictable(h[3] < h[2], 3, 2);
+                let m = select_unpredictable(h[b] < h[a], b, a);
+                (c + m, h[m])
             } else if c < n {
                 let mut m = (c, self.r[c]);
                 for j in c + 1..n {
