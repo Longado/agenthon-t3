@@ -23,7 +23,7 @@
 
 [ABIDES](https://github.com/abides-sim/abides) 是一个基于智能体的限价订单簿市场模拟器。Agenthon 2026 第 3 赛道要求做更快的模拟器，输出必须和官方 ABIDES 分支完全一致。事件数取决于每一次随机抽样，所以更快的引擎必须按 Python 代码的顺序，重放 numpy `RandomState` 的每一次抽样。
 
-本仓库包括：引擎本身（`native/`，一个 `t3sim` 程序，有 `simulate` 和 `simulate-batch` 两个命令）；它复刻的 ABIDES（`abides/`，固定在 `f9cbe51`，加官方第 3 赛道的四个补丁）；Python 适配层（`abides_fork/`）；以及核对和计时用的工具（`bench/`）。
+本仓库包括：引擎本身（`native/`，一个 `t3sim` 程序，有 `simulate` 和 `simulate-batch` 两个命令）；它复刻的 ABIDES（`abides/`，固定在 `f9cbe51`，加官方第 3 赛道的四个补丁，另有不改变输出的 Python 层提速）；Python 适配层（`abides_fork/`）；以及核对和计时用的工具（`bench/`）。
 
 > **这是一份参赛作品，不是通用库。** 引擎覆盖公开场景里的四种智能体和下单路径，其他情况交给 Python 适配层，设了 `T3SIM_NO_FALLBACK=1` 时直接拒绝。已核对：65 个公开单场景的 `trace.parquet` 和 `message_trace.parquet` 内容与 Python 版相同（本次发布前重跑过），开发期间另用 `bench/fuzz.py` 对比过随机变体。未核对：公开参数范围以外的场景。见[已知问题](#已知问题)。
 

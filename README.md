@@ -23,7 +23,7 @@ On the same public scenario and the same Mac, the Python path in this repo takes
 
 [ABIDES](https://github.com/abides-sim/abides) is an agent-based simulator of a limit-order-book market. Agenthon 2026 Track 3 asked for faster simulators whose output matches the reference ABIDES fork exactly. The event count depends on every random draw, so a faster engine has to replay numpy's `RandomState` draws in the same order as the Python code.
 
-This repo holds that engine (`native/`, a single `t3sim` binary with `simulate` and `simulate-batch` verbs), the pinned ABIDES it reproduces (`abides/`, commit `f9cbe51` plus the four official Track 3 patches), the Python adapter (`abides_fork/`), and the tools used to check and time it (`bench/`).
+This repo holds that engine (`native/`, a single `t3sim` binary with `simulate` and `simulate-batch` verbs), the pinned ABIDES it reproduces (`abides/`, commit `f9cbe51` plus the four official Track 3 patches, with Python-level speedups that leave its output unchanged), the Python adapter (`abides_fork/`), and the tools used to check and time it (`bench/`).
 
 > **A competition entry, not a library.** The engine covers the four agent types and the order paths in the public Track 3 scenarios. Anything else is handed to the Python adapter, or refused with `T3SIM_NO_FALLBACK=1`. Checked: all 65 public single scenarios give the same `trace.parquet` and `message_trace.parquet` content as the Python path (rerun for this release), plus random variants through `bench/fuzz.py` during development. Not checked: scenario shapes outside the public vocabulary. See [Known issues](#known-issues).
 
